@@ -307,27 +307,40 @@ def tool_deck_create(deck_id: str) -> Dict[str, Any]:
 
 
 @handle_tool_errors
-def tool_deck_load(deck_id: str, track_id: str) -> Dict[str, Any]:
+def tool_deck_load(
+    deck_id: str,
+    track_id: Optional[str] = None,
+    audio_path: Optional[str] = None,
+) -> Dict[str, Any]:
     sess = get_active_session()
     proj = sess.require_project()
     if deck_id not in proj.decks:
         raise ResourceNotFoundError("deck", deck_id, suggested_tool="deck_create", suggested_arguments={"deck_id": deck_id})
 
-    track = sess.library.get_track(track_id)
+    identifier = track_id or audio_path
+    if not identifier:
+        raise ValidationError("track_id", "Either track_id or audio_path must be specified.")
+
+    p = Path(identifier).expanduser()
+    if p.exists() and p.is_file():
+        track = sess.library.import_track(p)
+    else:
+        track = sess.library.get_track(identifier)
+
     if not track.analysis:
-        track.analysis = sess.library.analyze_track(track_id)
+        track.analysis = sess.library.analyze_track(track.track_id)
 
     bpm = track.analysis.get("bpm", 120.0)
     first_beat = track.analysis.get("first_beat_sec", 0.0)
     bg = BeatGrid.generate_constant_grid(bpm=bpm, first_beat_sec=first_beat, duration_sec=track.metadata.duration_seconds)
 
     deck = proj.decks[deck_id]
-    deck.load_track(track_id=track_id, audio_path=track.file_path, bpm=bpm, beatgrid=bg)
+    deck.load_track(track_id=track.track_id, audio_path=track.file_path, bpm=bpm, beatgrid=bg)
 
     return success_response(
         {
             "deck_id": deck_id,
-            "track_id": track_id,
+            "track_id": track.track_id,
             "bpm": bpm,
             "key": track.analysis.get("key"),
             "camelot": track.analysis.get("camelot"),
@@ -1241,6 +1254,7 @@ def tool_render_project(
     audio = sess.renderer.render_timeline(
         timeline=proj.timeline,
         mixer=proj.mixer,
+        decks=proj.decks,
         start_sec=start_sec,
         end_sec=end_sec,
         sample_rate=proj.sample_rate,

@@ -1,4 +1,5 @@
 import pytest
+import numpy as np
 from ai_dj.beatgrid import BeatGrid
 from ai_dj.decks import Deck
 from ai_dj.errors import DJError, PrerequisiteError
@@ -73,3 +74,50 @@ def test_crossfader_curves():
     ga_lin, gb_lin = calculate_crossfader_gains(0.0, curve="linear")
     assert ga_lin == 0.5
     assert gb_lin == 0.5
+
+
+def test_deck_audio_rendering_and_project_mix(tmp_path, test_audio_file):
+    import pytest
+    from ai_dj.project import Project
+    from ai_dj.rendering import ProjectRenderer
+    from ai_dj.errors import PrerequisiteError
+
+    # 1. Deck audio rendering
+    deck = Deck(deck_id="deck_a")
+    deck.load_track("track_1", test_audio_file, bpm=120.0)
+    deck.play()
+    deck.set_bpm(130.0)  # Time stretch
+    deck.set_loop(length_beats=4.0, start_sec=0.5)
+
+    audio = deck.render_deck_audio(duration_sec=2.0, target_sample_rate=44100)
+    assert audio.shape == (2, 44100 * 2)
+    assert np.max(np.abs(audio)) > 0.0
+
+    # 2. Project rendering with decks and empty timeline
+    proj = Project.create_new("p_dj", "DJ Set", sample_rate=44100, num_decks=2)
+    proj.decks["deck_a"].load_track("track_1", test_audio_file, bpm=120.0)
+    proj.decks["deck_a"].play()
+
+    renderer = ProjectRenderer()
+    mix = renderer.render_timeline(
+        timeline=proj.timeline,
+        mixer=proj.mixer,
+        decks=proj.decks,
+        start_sec=0.0,
+        end_sec=2.0,
+        sample_rate=44100,
+    )
+    assert mix.shape == (2, 44100 * 2)
+    assert np.max(np.abs(mix)) > 0.0
+
+    # 3. PrerequisiteError when nothing to render
+    empty_proj = Project.create_new("p_empty", "Empty Set")
+    with pytest.raises(PrerequisiteError) as exc_info:
+        renderer.render_timeline(
+            timeline=empty_proj.timeline,
+            mixer=empty_proj.mixer,
+            decks=empty_proj.decks,
+            start_sec=0.0,
+            end_sec=2.0,
+        )
+    assert exc_info.value.code == "NOTHING_TO_RENDER"

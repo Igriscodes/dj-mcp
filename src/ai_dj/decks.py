@@ -1,8 +1,12 @@
+import math
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+import numpy as np
+import soundfile as sf
 from pydantic import BaseModel, Field
 from ai_dj.beatgrid import BeatGrid
 from ai_dj.cues import CuePoint
+from ai_dj.engines.rubberband_engine import RubberBandEngine
 from ai_dj.errors import DJError, PrerequisiteError, ValidationError
 from ai_dj.loops import Loop
 from ai_dj.tempo import calculate_pitch_fader_percent, calculate_tempo_ratio
@@ -147,3 +151,93 @@ class Deck(BaseModel):
 
     def clear_loop(self) -> None:
         self.active_loop = None
+
+    def render_deck_audio(
+        self,
+        duration_sec: float,
+        target_sample_rate: int = 44100,
+    ) -> np.ndarray:
+        target_frames = int(round(duration_sec * target_sample_rate))
+        if target_frames <= 0 or not self.loaded_audio_path or not self.loaded_audio_path.exists():
+            return np.zeros((2, max(0, target_frames)), dtype=np.float32)
+
+        try:
+            raw_data, file_sr = sf.read(str(self.loaded_audio_path), always_2d=True, dtype="float32")
+        except Exception as e:
+            raise DJError(
+                code="DECK_AUDIO_READ_ERROR",
+                message=f"Failed to read audio from '{self.loaded_audio_path}' for deck '{self.deck_id}': {str(e)}",
+            ) from e
+
+        source_audio = raw_data.T
+        if source_audio.shape[0] == 1:
+            source_audio = np.repeat(source_audio, 2, axis=0)
+        elif source_audio.shape[0] > 2:
+            source_audio = source_audio[:2, :]
+
+        sr = target_sample_rate
+        if file_sr != sr:
+            import scipy.signal as signal
+            gcd = math.gcd(file_sr, sr)
+            up = sr // gcd
+            down = file_sr // gcd
+            source_audio = signal.resample_poly(source_audio, up, down, axis=1).astype(np.float32)
+
+        rate = 1.0
+        if self.original_bpm > 0 and self.current_bpm > 0:
+            rate = float(self.current_bpm / self.original_bpm)
+
+        pitch_semitones = float(self.pitch_semitones)
+        if not self.key_lock and abs(rate - 1.0) > 1e-4 and pitch_semitones == 0.0:
+            pitch_semitones = 12.0 * math.log2(rate)
+
+        source_needed_frames = int(math.ceil(duration_sec * rate * sr)) if rate > 0 else target_frames
+        source_needed_frames = max(1, source_needed_frames)
+
+        num_source_frames = source_audio.shape[1]
+        start_frame = max(0, min(int(self.position_sec * sr), num_source_frames))
+
+        source_buf = np.zeros((2, source_needed_frames), dtype=np.float32)
+
+        loop_active = (self.active_loop is not None and self.active_loop.is_active)
+        if loop_active and num_source_frames > 0:
+            l_start = max(0, min(int(self.active_loop.start_sec * sr), num_source_frames - 1))
+            l_end = max(l_start + 1, min(int(self.active_loop.end_sec * sr), num_source_frames))
+            loop_len = max(1, l_end - l_start)
+            loop_slice = source_audio[:, l_start:l_end]
+
+            cur_idx = 0
+            if start_frame < l_start:
+                pre_len = min(l_start - start_frame, source_needed_frames)
+                source_buf[:, :pre_len] = source_audio[:, start_frame:start_frame + pre_len]
+                cur_idx = pre_len
+                cur_loop_offset = 0
+            else:
+                cur_loop_offset = (start_frame - l_start) % loop_len
+
+            while cur_idx < source_needed_frames:
+                chunk_len = min(loop_len - cur_loop_offset, source_needed_frames - cur_idx)
+                source_buf[:, cur_idx:cur_idx + chunk_len] = loop_slice[:, cur_loop_offset:cur_loop_offset + chunk_len]
+                cur_idx += chunk_len
+                cur_loop_offset = 0
+        else:
+            avail = max(0, num_source_frames - start_frame)
+            take = min(avail, source_needed_frames)
+            if take > 0:
+                source_buf[:, :take] = source_audio[:, start_frame:start_frame + take]
+
+        rb = RubberBandEngine()
+        out_audio = source_buf
+        if abs(rate - 1.0) > 1e-4:
+            out_audio = rb.time_stretch(out_audio, sr, rate)
+
+        if abs(pitch_semitones) > 1e-4:
+            out_audio = rb.pitch_shift(out_audio, sr, pitch_semitones)
+
+        if out_audio.shape[1] > target_frames:
+            out_audio = out_audio[:, :target_frames]
+        elif out_audio.shape[1] < target_frames:
+            pad = np.zeros((2, target_frames - out_audio.shape[1]), dtype=np.float32)
+            out_audio = np.concatenate([out_audio, pad], axis=1)
+
+        return out_audio.astype(np.float32)

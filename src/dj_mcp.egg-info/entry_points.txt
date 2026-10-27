@@ -1,0 +1,4 @@
+[console_scripts]
+dj-mcp = ai_dj.cli:main
+dj-mcp-server = ai_dj.mcp.server:main
+dj-mcp.server = ai_dj.mcp.server:main

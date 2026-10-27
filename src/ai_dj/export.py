@@ -28,6 +28,13 @@ def export_audio_to_file(
     # soundfile expects (samples, channels)
     data = audio.T if audio.ndim == 2 else np.expand_dims(audio, axis=1)
 
+    if data.shape[0] == 0:
+        raise DJError(
+            code="EMPTY_AUDIO_EXPORT",
+            message=f"Cannot export '{output_path}': audio signal contains 0 samples.",
+            reason="empty_audio",
+        )
+
     subtype_map = {
         16: "PCM_16",
         24: "PCM_24",
