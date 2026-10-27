@@ -1,0 +1,78 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dj-mcp"
+version = "0.1.0"
+description = "AI-controlled professional music production and DJ editing library with Model Context Protocol (MCP) server."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+    { name = "Antigravity Audio Team" }
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: End Users/Desktop",
+    "Topic :: Multimedia :: Sound/Audio",
+    "Topic :: Multimedia :: Sound/Audio :: Editors",
+    "Topic :: Multimedia :: Sound/Audio :: Analysis",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: OS Independent"
+]
+
+dependencies = [
+    "numpy>=1.24.0",
+    "scipy>=1.10.0",
+    "soundfile>=0.12.0",
+    "pydantic>=2.0.0",
+    "mcp>=1.0.0",
+    "fastmcp>=0.4.0",
+    "click>=8.0.0",
+    "psutil>=5.9.0",
+    "pyyaml>=6.0.0",
+]
+
+[project.optional-dependencies]
+dsp = [
+    "pedalboard>=0.9.0",
+    "pyrubberband>=0.4.0",
+]
+analysis = [
+    "librosa>=0.10.0",
+    "pyloudnorm>=0.2.0",
+    "soxr>=0.3.0",
+]
+stems = [
+    "demucs>=4.0.0",
+    "torch>=2.0.0",
+    "torchaudio>=2.0.0",
+]
+all = [
+    "pedalboard>=0.9.0",
+    "pyrubberband>=0.4.0",
+    "librosa>=0.10.0",
+    "pyloudnorm>=0.2.0",
+    "soxr>=0.3.0",
+    "demucs>=4.0.0",
+    "torch>=2.0.0",
+    "torchaudio>=2.0.0",
+]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+]
+
+[project.scripts]
+dj-mcp = "ai_dj.cli:main"
+"dj-mcp.server" = "ai_dj.mcp.server:main"
+dj-mcp-server = "ai_dj.mcp.server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
