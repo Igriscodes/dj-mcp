@@ -1110,6 +1110,7 @@ def tool_separate_stems(
     audio_path: str,
     output_dir: Optional[str] = None,
     model_name: str = "htdemucs",
+    device: Optional[str] = None,
     wait: bool = True,
 ) -> Dict[str, Any]:
     sess = get_active_session()
@@ -1126,7 +1127,7 @@ def tool_separate_stems(
         )
 
     if wait:
-        res_paths = sep.separate(safe_audio, out_dir)
+        res_paths = sep.separate(safe_audio, out_dir, device=device)
         stems_dict = {k: str(v) for k, v in res_paths.items()}
         if sess.current_project:
             from ai_dj.stems import StemSet
@@ -1138,17 +1139,26 @@ def tool_separate_stems(
             )
             sess.current_project.stems[s_set.set_id] = s_set
 
+        warnings = []
+        if sep.fallback_occurred:
+            import os
+            warnings.append(
+                f"CUDA Out of Memory on GPU (VRAM occupied by LLMs or other workloads). Automatically shifted to CPU using all {os.cpu_count()} cores at full performance."
+            )
+
         return success_response({
             "status": "completed",
             "output_directory": str(out_dir),
             "stems": stems_dict,
             "model_used": model_name,
+            "device_used": sep.last_device_used,
+            "fallback_to_cpu": sep.fallback_occurred,
             "stems_count": len(stems_dict),
-        })
+        }, warnings=warnings)
 
     # Run separation as background job
     def job_fn():
-        return sep.separate(safe_audio, out_dir)
+        return sep.separate(safe_audio, out_dir, device=device)
 
     job_id = sess.job_manager.submit_job(f"Stem Separation: {safe_audio.name}", job_fn)
     return job_response(job_id)

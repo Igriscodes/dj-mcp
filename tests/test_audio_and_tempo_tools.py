@@ -238,3 +238,36 @@ def test_audio_merge_and_stems_merge(tmp_path, test_audio_file):
     assert out_merged.exists()
     assert res["result"]["file_count"] == 3
     assert res["result"]["peak_dbfs"] == -0.5
+
+
+def test_demucs_cuda_oom_cpu_fallback(tmp_path, test_audio_file, monkeypatch):
+    import torch
+    from unittest.mock import MagicMock
+    from ai_dj.engines.separation_engine import SeparationEngine
+    import demucs.apply
+
+    engine = SeparationEngine()
+    orig_apply_model = demucs.apply.apply_model
+    call_devices = []
+
+    def mock_apply_model(model, input_tensor, **kwargs):
+        dev = str(input_tensor.device)
+        call_devices.append(dev)
+        if "cuda" in dev:
+            raise torch.cuda.OutOfMemoryError("CUDA out of memory while allocating tensor")
+        # For CPU fallback return dummy tensor with (batch=1, sources=4, channels=2, time)
+        return torch.zeros((1, 4, 2, input_tensor.shape[-1]))
+
+    monkeypatch.setattr(demucs.apply, "apply_model", mock_apply_model)
+
+    out_dir = tmp_path / "oom_stems"
+    res = engine.separate(
+        audio_path=test_audio_file,
+        output_dir=out_dir,
+        device="cuda",
+    )
+    assert engine.fallback_occurred is True
+    assert engine.last_device_used == "cpu"
+    assert "cuda" in call_devices[0]
+    assert "cpu" in call_devices[1]
+    assert (out_dir / "vocals.wav").exists()
