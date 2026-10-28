@@ -67,6 +67,18 @@ def run_doctor(as_json: bool = False) -> int:
     return 0
 
 
+def download_models(model_name: str = "htdemucs") -> int:
+    print(f"Downloading pretrained AI model '{model_name}' for stem separation...")
+    try:
+        from demucs.pretrained import get_model
+        model = get_model(model_name)
+        print(f"✓ Model '{model_name}' successfully downloaded and cached locally.")
+        return 0
+    except Exception as e:
+        print(f"✗ Failed to download model '{model_name}': {e}", file=sys.stderr)
+        return 1
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(prog="dj-mcp", description="DJ MCP - Professional AI Audio Workstation")
     subparsers = parser.add_subparsers(dest="command")
@@ -74,6 +86,10 @@ def main() -> None:
     # doctor
     doc_parser = subparsers.add_parser("doctor", help="Run system diagnostics and capability checks")
     doc_parser.add_argument("--json", action="store_true", help="Output machine-readable JSON")
+
+    # download-models
+    dl_parser = subparsers.add_parser("download-models", help="Pre-download AI stem separation models (Demucs)")
+    dl_parser.add_argument("--model", default="htdemucs", help="Model name to download (default: htdemucs)")
 
     # server
     srv_parser = subparsers.add_parser("server", help="Start the MCP server")
@@ -85,6 +101,8 @@ def main() -> None:
 
     if args.command == "doctor":
         sys.exit(run_doctor(as_json=args.json))
+    elif args.command == "download-models":
+        sys.exit(download_models(model_name=args.model))
     elif args.command == "server":
         sys.argv = ["dj-mcp.server", "--transport", args.transport]
         if args.transport == "sse":

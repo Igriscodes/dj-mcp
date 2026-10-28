@@ -124,3 +124,45 @@ def check_key_compatibility(key_a: str, key_b: str) -> Dict[str, Any]:
         "relationship": relationship,
         "suggested_keys": compatibles,
     }
+
+
+NOTE_PITCH_CLASSES: Dict[str, int] = {
+    "C": 0, "B#": 0,
+    "C#": 1, "DB": 1, "Db": 1,
+    "D": 2,
+    "D#": 3, "EB": 3, "Eb": 3,
+    "E": 4, "FB": 4,
+    "F": 5, "E#": 5,
+    "F#": 6, "GB": 6, "Gb": 6,
+    "G": 7,
+    "G#": 8, "AB": 8, "Ab": 8,
+    "A": 9,
+    "A#": 10, "BB": 10, "Bb": 10,
+    "B": 11, "CB": 11,
+}
+
+
+def get_tonic_pitch_class(key_name: str) -> int:
+    clean = key_name.strip()
+    upper = clean.upper()
+    if upper in CAMELOT_TO_KEY:
+        clean = CAMELOT_TO_KEY[upper]
+
+    # Split tonic note from mode (e.g. "F# minor" -> "F#")
+    parts = clean.split()
+    note_str = parts[0] if parts else clean
+    # Check 2-char then 1-char
+    if len(note_str) >= 2 and note_str[:2] in NOTE_PITCH_CLASSES:
+        return NOTE_PITCH_CLASSES[note_str[:2]]
+    if len(note_str) >= 1 and note_str[:1] in NOTE_PITCH_CLASSES:
+        return NOTE_PITCH_CLASSES[note_str[:1]]
+    return 0
+
+
+def calculate_key_semitone_shift(source_key: str, target_key: str) -> float:
+    p_src = get_tonic_pitch_class(source_key)
+    p_dst = get_tonic_pitch_class(target_key)
+    diff = (p_dst - p_src) % 12
+    if diff > 6:
+        diff -= 12
+    return float(diff)

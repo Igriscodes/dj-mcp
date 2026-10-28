@@ -118,3 +118,191 @@ class RubberBandEngine:
                 code="PITCH_SHIFT_FAILED",
                 message=f"Pitch shift processing failed: {str(e)}",
             ) from e
+
+    def change_speed(
+        self,
+        audio: np.ndarray,
+        sample_rate: int,
+        speed_ratio: float,
+    ) -> np.ndarray:
+        if speed_ratio <= 0.0:
+            raise ValidationError("speed_ratio", "Speed ratio must be strictly positive (> 0.0)")
+        if abs(speed_ratio - 1.0) < 1e-4:
+            return audio.copy()
+
+        import scipy.signal as signal
+        from fractions import Fraction
+        frac = Fraction(float(speed_ratio)).limit_denominator(1000)
+        up, down = frac.numerator, frac.denominator
+        # Resample across time axis: output length = N / speed_ratio = N * down / up
+        resampled = signal.resample_poly(audio, down, up, axis=-1)
+        return np.ascontiguousarray(resampled, dtype=np.float32)
+
+    def paulstretch(
+        self,
+        audio: np.ndarray,
+        sample_rate: int,
+        stretch_factor: float = 8.0,
+        window_size_sec: float = 0.25,
+    ) -> np.ndarray:
+        if stretch_factor <= 1.0:
+            return audio.copy()
+
+        window_size = int(window_size_sec * sample_rate)
+        if window_size % 2 == 1:
+            window_size += 1
+        half_win = window_size // 2
+        h_in = max(1, int(half_win / stretch_factor))
+
+        is_1d = audio.ndim == 1
+        channels = [audio] if is_1d else [audio[c] for c in range(audio.shape[0])]
+        out_channels = []
+
+        win = np.hanning(window_size).astype(np.float32)
+        for ch in channels:
+            n_samples = len(ch)
+            out_len = int(n_samples * stretch_factor)
+            out = np.zeros(out_len + window_size * 2, dtype=np.float32)
+
+            in_pos = 0
+            out_pos = 0
+            while in_pos + window_size <= n_samples:
+                segment = ch[in_pos:in_pos + window_size] * win
+                spec = np.fft.rfft(segment)
+                phases = np.random.uniform(0, 2 * np.pi, len(spec))
+                rand_spec = np.abs(spec) * np.exp(1j * phases)
+                stretched_seg = np.fft.irfft(rand_spec, n=window_size) * win
+                out[out_pos:out_pos + window_size] += stretched_seg
+                in_pos += h_in
+                out_pos += half_win
+            out_channels.append(out[:out_len])
+
+        res = np.vstack(out_channels) if not is_1d else out_channels[0]
+        max_val = float(np.max(np.abs(res))) if res.size > 0 else 0.0
+        if max_val > 1.0:
+            res = res / max_val
+        return np.ascontiguousarray(res, dtype=np.float32)
+
+    def truncate_silence(
+        self,
+        audio: np.ndarray,
+        sample_rate: int,
+        threshold_db: float = -50.0,
+        min_silence_sec: float = 0.5,
+        truncate_to_sec: float = 0.0,
+    ) -> np.ndarray:
+        thresh_lin = 10.0 ** (threshold_db / 20.0)
+        mono = np.max(np.abs(audio), axis=0) if audio.ndim == 2 else np.abs(audio)
+
+        frame_len = max(1, int(0.01 * sample_rate))
+        n_frames = len(mono) // frame_len
+        if n_frames == 0:
+            return audio.copy()
+
+        frames_energy = np.array([np.max(mono[i * frame_len : (i + 1) * frame_len]) for i in range(n_frames)])
+        is_silent = frames_energy < thresh_lin
+
+        min_silence_frames = max(1, int(min_silence_sec / 0.01))
+        target_silence_frames = max(0, int(truncate_to_sec / 0.01))
+
+        keep_mask = np.ones(n_frames, dtype=bool)
+        i = 0
+        while i < n_frames:
+            if is_silent[i]:
+                j = i
+                while j < n_frames and is_silent[j]:
+                    j += 1
+                silence_len = j - i
+                if silence_len >= min_silence_frames:
+                    drop_start = i + target_silence_frames
+                    if drop_start < j:
+                        keep_mask[drop_start:j] = False
+                i = j
+            else:
+                i += 1
+
+        kept_indices = []
+        for idx, keep in enumerate(keep_mask):
+            if keep:
+                start_idx = idx * frame_len
+                end_idx = min((idx + 1) * frame_len, audio.shape[-1])
+                kept_indices.extend(range(start_idx, end_idx))
+
+        if not kept_indices:
+            return audio[:, :frame_len] if audio.ndim == 2 else audio[:frame_len]
+        return np.ascontiguousarray(audio[:, kept_indices] if audio.ndim == 2 else audio[kept_indices], dtype=np.float32)
+
+    def declick(
+        self,
+        audio: np.ndarray,
+        sample_rate: int,
+        sensitivity: float = 0.5,
+    ) -> np.ndarray:
+        # Detect sharp clicks via 2nd order discrete derivative
+        out = audio.copy()
+        thresh = max(0.05, (1.0 - sensitivity) * 0.5)
+        if out.ndim == 1:
+            diff2 = np.abs(np.diff(out, n=2))
+            clicks = np.where(diff2 > thresh)[0] + 1
+            for c in clicks:
+                if 1 <= c < len(out) - 1:
+                    out[c] = 0.5 * (out[c - 1] + out[c + 1])
+        else:
+            for ch in range(out.shape[0]):
+                diff2 = np.abs(np.diff(out[ch], n=2))
+                clicks = np.where(diff2 > thresh)[0] + 1
+                for c in clicks:
+                    if 1 <= c < out.shape[1] - 1:
+                        out[ch, c] = 0.5 * (out[ch, c - 1] + out[ch, c + 1])
+        return np.ascontiguousarray(out, dtype=np.float32)
+
+    def denoise(
+        self,
+        audio: np.ndarray,
+        sample_rate: int,
+        reduction_db: float = 12.0,
+    ) -> np.ndarray:
+        # High quality downward noise gating via Pedalboard
+        try:
+            import pedalboard
+            gate = pedalboard.NoiseGate(threshold_db=max(-80.0, -reduction_db - 40.0), ratio=3.0)
+            data = audio if audio.ndim == 2 else np.expand_dims(audio, axis=0)
+            processed = gate(data.astype(np.float32), sample_rate)
+            return np.ascontiguousarray(processed if audio.ndim == 2 else processed[0], dtype=np.float32)
+        except Exception:
+            return audio.copy()
+
+    def vocal_remover(
+        self,
+        audio: np.ndarray,
+        sample_rate: int,
+        mode: str = "remove_vocals",
+        low_cutoff_hz: float = 120.0,
+        high_cutoff_hz: float = 8000.0,
+    ) -> np.ndarray:
+        # Center-channel extraction / cancellation with bass preservation
+        if audio.ndim == 1 or audio.shape[0] < 2:
+            return audio.copy()
+
+        l = audio[0]
+        r = audio[1]
+
+        # Mid (center) and Side
+        mid = 0.5 * (l + r)
+        side = 0.5 * (l - r)
+
+        import scipy.signal as signal
+        # Lowpass filter for preserving bass (kick, sub) in vocal removal
+        sos_bass = signal.butter(4, low_cutoff_hz, btype="lowpass", fs=sample_rate, output="sos")
+        bass_mono = signal.sosfilt(sos_bass, mid)
+
+        if mode == "isolate_vocals":
+            # Bandpass center channel for vocal isolation
+            sos_vocal = signal.butter(4, [low_cutoff_hz, min(high_cutoff_hz, (sample_rate / 2) - 100)], btype="bandpass", fs=sample_rate, output="sos")
+            vocal = signal.sosfilt(sos_vocal, mid)
+            return np.ascontiguousarray(np.stack([vocal, vocal]), dtype=np.float32)
+        else:
+            # Vocal removal: Side signal + preserved bass
+            out_l = side + bass_mono
+            out_r = -side + bass_mono
+            return np.ascontiguousarray(np.stack([out_l, out_r]), dtype=np.float32)

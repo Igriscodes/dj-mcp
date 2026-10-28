@@ -526,7 +526,7 @@ DJ-MCP exposes high-level, deterministic tools with strict Pydantic parameter sc
 | `deck_pause` | Pause deck playback. | `deck_id: str` |
 | `deck_stop` | Stop playback and reset playhead to 0.0s. | `deck_id: str` |
 | `deck_seek` | Jump to position in seconds (quantized). | `deck_id: str`, `position_sec: float`, `quantize: bool=True` |
-| `deck_sync` | Lock tempo and beat-phase to master deck. | `deck_id: str`, `master_deck_id: str` |
+| `deck_sync` | Lock tempo and beat-phase to master deck with smart half/double-time support. | `deck_id: str`, `master_deck_id: str`, `allow_half_double_time: bool=True` |
 | `deck_set_bpm` | Set explicit playback tempo. | `deck_id: str`, `bpm: float` |
 | `deck_set_pitch` | Adjust pitch fader percentage. | `deck_id: str`, `pitch_percent: float` |
 | `deck_set_key` | Shift pitch in semitones (Key Lock active). | `deck_id: str`, `semitones: float` |
@@ -583,6 +583,24 @@ DJ-MCP exposes high-level, deterministic tools with strict Pydantic parameter sc
 | `render_project` | Render entire timeline mix to audio file. | `output_path: str`, `start_sec: float=0.0`, `end_sec: Optional[float]`, `format: str='wav'`, `bit_depth: int=24` |
 | `render_preview` | Render short preview snippet (15s). | `output_path: str`, `start_sec: float=0.0`, `duration_sec: float=15.0` |
 | `export_audio` | Transcode file to target codec & bit depth. | `input_file: str`, `output_file: str`, `format: str`, `bit_depth: int=24` |
+
+### 9. Direct Audio & Pitch/Tempo Editing (Audacity-Style Standalone DSP)
+| Tool | Description | Key Arguments |
+| :--- | :--- | :--- |
+| `audio_change_tempo` | Change tempo of audio file/track by target BPM, percentage, or duration with pitch preservation. Auto-detects source BPM. | `input_file: str`, `output_file: str`, `target_bpm: float`, `tempo_change_percent: float`, `preserve_pitch: bool=True` |
+| `audio_change_pitch` | Shift pitch of audio file/track by semitones, cents, or target musical key (e.g. `G minor` to `A minor`) with tempo preservation. | `input_file: str`, `output_file: str`, `semitones: float`, `from_key: str`, `to_key: str`, `preserve_tempo: bool=True` |
+| `audio_change_speed` | Varispeed pitch+speed change (analog tape, vinyl 33.3 to 45 RPM). | `input_file: str`, `output_file: str`, `speed_ratio: float`, `from_rpm: float`, `to_rpm: float` |
+| `audio_paulstretch` | Extreme phase-randomized spectral stretch (3x - 50x) for ambient drone design. | `input_file: str`, `output_file: str`, `stretch_factor: float=8.0`, `window_size_sec: float=0.25` |
+| `audio_reverse` | Play audio file backward in time. | `input_file: str`, `output_file: str` |
+| `audio_invert_polarity` | Invert signal phase/polarity (both channels, left, or right). | `input_file: str`, `output_file: str`, `channels: str='both'` |
+| `audio_truncate_silence` | Automatically strip or compress silent intervals below threshold dB. | `input_file: str`, `output_file: str`, `threshold_db: float=-50.0`, `min_silence_sec: float=0.5`, `truncate_to_sec: float=0.0` |
+| `audio_denoise` | Adaptive noise reduction and downward noise gating. | `input_file: str`, `output_file: str`, `reduction_db: float=12.0` |
+| `audio_declick` | Detect and interpolate clicks, pops, and vinyl crackle. | `input_file: str`, `output_file: str`, `sensitivity: float=0.5` |
+| `audio_vocal_remover` | Center-channel extraction / cancellation with bass preservation (karaoke / vocal isolation). | `input_file: str`, `output_file: str`, `mode: str='remove_vocals'`, `low_cutoff_hz: float=120.0` |
+| `audio_merge` | Mix/merge multiple audio files or stems together with anti-clipping normalization. | `input_files: Union[List[str], str]`, `output_file: str`, `normalize: bool=False` |
+| `stems_merge` | Automatically scan a stems directory and recombine all stems into a single song file. | `stems_dir: str`, `output_file: str`, `normalize: bool=True`, `target_peak_dbfs: float=-0.5` |
+| `timeline_set_tempo` | Set master DAW project/timeline BPM with optional non-destructive clip re-timing. | `bpm: float`, `stretch_clips: bool=True` |
+| `timeline_get_tempo` | Get active project/timeline BPM and time signature. | *(none)* |
 
 ---
 

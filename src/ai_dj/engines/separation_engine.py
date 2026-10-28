@@ -99,9 +99,16 @@ class SeparationEngine:
                 if stems and name not in stems:
                     continue
                 out_file = output_dir / f"{audio_path.stem}_{name}.wav"
+                short_file = output_dir / f"{name}.wav"
                 source_cpu = source.cpu().numpy()
                 # soundfile write expects (samples, channels)
                 sf.write(str(out_file), source_cpu.T, sr, subtype="PCM_24")
+                if out_file != short_file:
+                    try:
+                        import shutil
+                        shutil.copyfile(str(out_file), str(short_file))
+                    except Exception:
+                        sf.write(str(short_file), source_cpu.T, sr, subtype="PCM_24")
                 results[name] = out_file
 
             return results

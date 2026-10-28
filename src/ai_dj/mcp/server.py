@@ -96,6 +96,8 @@ from ai_dj.mcp.tools import (
     tool_stem_gain,
     tool_stem_align,
     tool_stem_export,
+    tool_stems_merge,
+    tool_audio_merge,
     tool_master_analyze,
     tool_master_process,
     tool_master_normalize,
@@ -107,6 +109,18 @@ from ai_dj.mcp.tools import (
     tool_render_stems,
     tool_render_project,
     tool_export_audio,
+    tool_audio_change_tempo,
+    tool_audio_change_pitch,
+    tool_audio_change_speed,
+    tool_audio_paulstretch,
+    tool_audio_reverse,
+    tool_audio_invert_polarity,
+    tool_audio_truncate_silence,
+    tool_audio_denoise,
+    tool_audio_declick,
+    tool_audio_vocal_remover,
+    tool_timeline_set_tempo,
+    tool_timeline_get_tempo,
     tool_job_status,
     tool_job_cancel,
     tool_job_result,
@@ -239,6 +253,8 @@ def create_mcp_server() -> FastMCP:
     server.tool(name="stem_gain", description="Set gain in dB on specific stem.")(tool_stem_gain)
     server.tool(name="stem_align", description="Time-align stem with offset.")(tool_stem_align)
     server.tool(name="stem_export", description="Recombine and export stems to file.")(tool_stem_export)
+    server.tool(name="stems_merge", description="Recombine and merge all stems from a directory into a single audio file.")(tool_stems_merge)
+    server.tool(name="audio_merge", description="Mix and merge multiple audio files or stems together with anti-clipping protection.")(tool_audio_merge)
 
     # Mastering
     server.tool(name="master_analyze", description="Analyze loudness against mastering standards.")(tool_master_analyze)
@@ -254,6 +270,20 @@ def create_mcp_server() -> FastMCP:
     server.tool(name="render_stems", description="Render isolated stems mix.")(tool_render_stems)
     server.tool(name="render_project", description="Render entire project mix to audio file (WAV, FLAC, MP3, etc.).")(tool_render_project)
     server.tool(name="export_audio", description="Transcode and export audio file to target format and bit depth.")(tool_export_audio)
+
+    # Standalone Audio & Pitch/Tempo Editing (Audacity-Style Direct DSP)
+    server.tool(name="audio_change_tempo", description="Change tempo of an audio file or track (BPM, percent, duration) with pitch preservation.")(tool_audio_change_tempo)
+    server.tool(name="audio_change_pitch", description="Shift pitch of an audio file or track (semitones, cents, musical key) with tempo preservation.")(tool_audio_change_pitch)
+    server.tool(name="audio_change_speed", description="Change speed and pitch together (varispeed, tape speed, vinyl 33/45 RPM).")(tool_audio_change_speed)
+    server.tool(name="audio_paulstretch", description="Apply extreme Paulstretch time-stretching for lush ambient/drone sound design.")(tool_audio_paulstretch)
+    server.tool(name="audio_reverse", description="Reverse an audio file or track backward in time.")(tool_audio_reverse)
+    server.tool(name="audio_invert_polarity", description="Invert phase/polarity of audio channels.")(tool_audio_invert_polarity)
+    server.tool(name="audio_truncate_silence", description="Detect and truncate/strip silent intervals from an audio file.")(tool_audio_truncate_silence)
+    server.tool(name="audio_denoise", description="Reduce background noise using adaptive noise gating.")(tool_audio_denoise)
+    server.tool(name="audio_declick", description="Detect and remove clicks, vinyl crackle, and transient dropouts.")(tool_audio_declick)
+    server.tool(name="audio_vocal_remover", description="Isolate or remove vocals using center-channel extraction with bass preservation.")(tool_audio_vocal_remover)
+    server.tool(name="timeline_set_tempo", description="Set master project/timeline tempo in BPM with optional clip re-timing.")(tool_timeline_set_tempo)
+    server.tool(name="timeline_get_tempo", description="Get master project/timeline tempo and time signature.")(tool_timeline_get_tempo)
 
     # Jobs
     server.tool(name="job_status", description="Check status and progress of a background job.")(tool_job_status)

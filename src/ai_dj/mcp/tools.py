@@ -16,7 +16,7 @@ from ai_dj.engines.rubberband_engine import RubberBandEngine
 from ai_dj.engines.separation_engine import SeparationEngine
 from ai_dj.errors import DJError, PrerequisiteError, ResourceNotFoundError, ValidationError
 from ai_dj.export import export_audio_to_file
-from ai_dj.key import check_key_compatibility, key_to_camelot
+from ai_dj.key import calculate_key_semitone_shift, check_key_compatibility, key_to_camelot
 from ai_dj.mastering import MasteringProcessor
 from ai_dj.mcp.errors import handle_tool_errors
 from ai_dj.mcp.responses import error_response, job_response, success_response
@@ -403,7 +403,7 @@ def tool_deck_seek(deck_id: str, position_sec: float, quantize: bool = True) -> 
 
 
 @handle_tool_errors
-def tool_deck_sync(deck_id: str, master_deck_id: str) -> Dict[str, Any]:
+def tool_deck_sync(deck_id: str, master_deck_id: str, allow_half_double_time: bool = True) -> Dict[str, Any]:
     sess = get_active_session()
     proj = sess.require_project()
     if deck_id not in proj.decks:
@@ -416,11 +416,29 @@ def tool_deck_sync(deck_id: str, master_deck_id: str) -> Dict[str, Any]:
     slave = proj.decks[deck_id]
     slave.require_loaded()
 
-    slave.sync_to(target_bpm=master.current_bpm, target_beat_phase_sec=master.position_sec)
+    master_bpm = master.current_bpm
+    slave_orig = slave.original_bpm
+
+    target_bpm = master_bpm
+    sync_type = "exact"
+    if allow_half_double_time and slave_orig > 0:
+        candidates = [
+            (master_bpm, "exact"),
+            (master_bpm * 0.5, "half_time"),
+            (master_bpm * 2.0, "double_time"),
+        ]
+        best_bpm, best_type = min(candidates, key=lambda c: abs(math.log2(c[0] / slave_orig)))
+        target_bpm = best_bpm
+        sync_type = best_type
+
+    slave.sync_to(target_bpm=target_bpm, target_beat_phase_sec=master.position_sec)
     return success_response({
         "deck_id": deck_id,
         "master_deck_id": master_deck_id,
+        "master_bpm": master_bpm,
         "synced_bpm": slave.current_bpm,
+        "sync_type": sync_type,
+        "pitch_percent": round(slave.pitch_percent, 2),
         "synced_position_sec": slave.position_sec,
     })
 
@@ -546,14 +564,18 @@ def tool_quantize_to_grid(track_id: str, position_sec: float, quantum: str = "be
 def tool_clip_create(
     track_id: str,
     clip_id: str,
-    source_file: str,
+    source_file: Optional[str] = None,
+    file_path: Optional[str] = None,
     timeline_position_sec: float = 0.0,
     source_offset_sec: float = 0.0,
     duration_sec: float = 10.0,
 ) -> Dict[str, Any]:
     sess = get_active_session()
     proj = sess.require_project()
-    safe_file = resolve_safe_path(source_file, sess.config, must_exist=True)
+    src = source_file or file_path
+    if not src:
+        raise ValidationError("source_file", "Either source_file or file_path must be specified.")
+    safe_file = resolve_safe_path(src, sess.config, must_exist=True)
 
     if track_id not in proj.timeline.tracks:
         # Create track if not exists
@@ -1084,7 +1106,12 @@ def tool_analyze_transients(file_path: str) -> Dict[str, Any]:
 # ==========================================
 
 @handle_tool_errors
-def tool_separate_stems(audio_path: str, output_dir: Optional[str] = None, model_name: str = "htdemucs") -> Dict[str, Any]:
+def tool_separate_stems(
+    audio_path: str,
+    output_dir: Optional[str] = None,
+    model_name: str = "htdemucs",
+    wait: bool = True,
+) -> Dict[str, Any]:
     sess = get_active_session()
     safe_audio = resolve_safe_path(audio_path, sess.config, must_exist=True)
     out_dir = resolve_safe_path(output_dir or f"stems_{safe_audio.stem}", sess.config)
@@ -1097,6 +1124,27 @@ def tool_separate_stems(audio_path: str, output_dir: Optional[str] = None, model
             required_action="install_demucs",
             suggested_tool="system_capabilities",
         )
+
+    if wait:
+        res_paths = sep.separate(safe_audio, out_dir)
+        stems_dict = {k: str(v) for k, v in res_paths.items()}
+        if sess.current_project:
+            from ai_dj.stems import StemSet
+            s_set = StemSet(
+                set_id=f"stems_{safe_audio.stem}",
+                source_file=safe_audio,
+                model_used=model_name,
+                stems=res_paths,
+            )
+            sess.current_project.stems[s_set.set_id] = s_set
+
+        return success_response({
+            "status": "completed",
+            "output_directory": str(out_dir),
+            "stems": stems_dict,
+            "model_used": model_name,
+            "stems_count": len(stems_dict),
+        })
 
     # Run separation as background job
     def job_fn():
@@ -1169,6 +1217,124 @@ def tool_stem_export(set_id: str, output_path: str) -> Dict[str, Any]:
     target = resolve_safe_path(output_path, sess.config)
     exported = export_audio_to_file(recombined, target, sample_rate=proj.sample_rate)
     return success_response({"exported_file": str(exported)})
+
+
+@handle_tool_errors
+def tool_audio_merge(
+    input_files: Any,
+    output_file: str,
+    gains_db: Optional[Dict[str, float]] = None,
+    normalize: bool = False,
+    brickwall_limit: bool = True,
+    target_peak_dbfs: float = -0.5,
+    format: Optional[str] = None,
+    bit_depth: int = 24,
+) -> Dict[str, Any]:
+    sess = get_active_session()
+    target_out = resolve_safe_path(output_file, sess.config)
+
+    resolved_files: List[Path] = []
+    # 1. Resolve inputs: directory, list of files, or stem set ID
+    if isinstance(input_files, str):
+        clean_str = input_files.strip()
+        p = Path(clean_str).expanduser()
+        if p.is_dir():
+            audio_exts = {".wav", ".flac", ".mp3", ".ogg", ".aiff", ".aif", ".m4a"}
+            all_files = [f for f in sorted(p.iterdir()) if f.suffix.lower() in audio_exts]
+            # Avoid duplicate tracks if both vocals.wav and Yesha Nagula_vocals.wav exist
+            standard_stems = {"vocals", "drums", "bass", "other"}
+            std_matches = [f for f in all_files if f.stem.lower() in standard_stems]
+            resolved_files = std_matches if len(std_matches) >= 2 else all_files
+        elif sess.current_project and clean_str in sess.current_project.stems:
+            resolved_files = list(sess.current_project.stems[clean_str].stems.values())
+        elif "," in clean_str:
+            resolved_files = [resolve_safe_path(x.strip(), sess.config, must_exist=True) for x in clean_str.split(",") if x.strip()]
+        else:
+            resolved_files = [resolve_safe_path(clean_str, sess.config, must_exist=True)]
+    elif isinstance(input_files, (list, tuple)):
+        resolved_files = [resolve_safe_path(str(x), sess.config, must_exist=True) for x in input_files]
+    else:
+        raise ValidationError("input_files", "input_files must be a list of paths or directory string.")
+
+    if not resolved_files:
+        raise ValidationError("input_files", "No valid audio files found to merge.")
+
+    # 2. Read and align audio signals
+    signals: List[np.ndarray] = []
+    target_sr = 44100
+    for idx, fpath in enumerate(resolved_files):
+        data, sr = sf.read(str(fpath), always_2d=True, dtype="float32")
+        sig = data.T
+        if idx == 0:
+            target_sr = sr
+        elif sr != target_sr:
+            import scipy.signal as signal
+            gcd = math.gcd(sr, target_sr)
+            sig = signal.resample_poly(sig, target_sr // gcd, sr // gcd, axis=-1).astype(np.float32)
+
+        if sig.shape[0] == 1:
+            sig = np.repeat(sig, 2, axis=0)
+        elif sig.shape[0] > 2:
+            sig = sig[:2]
+
+        if gains_db:
+            gain = gains_db.get(fpath.name, gains_db.get(fpath.stem, 0.0))
+            if abs(gain) > 1e-4:
+                sig = sig * (10.0 ** (gain / 20.0))
+
+        signals.append(sig)
+
+    max_samples = max(s.shape[1] for s in signals)
+    summed = np.zeros((2, max_samples), dtype=np.float32)
+    for s in signals:
+        summed[:, :s.shape[1]] += s
+
+    # 3. Peak limiting and normalization to prevent clipping
+    peak = float(np.max(np.abs(summed))) if summed.size > 0 else 0.0
+    if normalize:
+        target_lin = 10.0 ** (target_peak_dbfs / 20.0)
+        if peak > 0:
+            summed = summed * (target_lin / peak)
+    elif brickwall_limit and peak > 1.0:
+        target_lin = 10.0 ** (target_peak_dbfs / 20.0)
+        summed = summed * (target_lin / peak)
+
+    exported = export_audio_to_file(
+        summed,
+        target_out,
+        sample_rate=target_sr,
+        bit_depth=bit_depth,
+        audio_format=format,
+    )
+
+    final_peak = float(np.max(np.abs(summed))) if summed.size > 0 else 0.0
+    peak_dbfs = round(20.0 * math.log10(max(1e-6, final_peak)), 2)
+
+    return success_response({
+        "output_file": str(exported),
+        "files_merged": [str(f) for f in resolved_files],
+        "file_count": len(resolved_files),
+        "duration_seconds": round(summed.shape[1] / target_sr, 3),
+        "channels": 2,
+        "sample_rate": target_sr,
+        "peak_dbfs": peak_dbfs,
+        "limited_or_normalized": normalize or (brickwall_limit and peak > 1.0),
+    })
+
+
+@handle_tool_errors
+def tool_stems_merge(
+    stems_dir: str,
+    output_file: str,
+    normalize: bool = True,
+    target_peak_dbfs: float = -0.5,
+) -> Dict[str, Any]:
+    return tool_audio_merge(
+        input_files=stems_dir,
+        output_file=output_file,
+        normalize=normalize,
+        target_peak_dbfs=target_peak_dbfs,
+    )
 
 
 # ==========================================
@@ -1312,6 +1478,427 @@ def tool_export_audio(
         bit_rate_kbps=bit_rate_kbps,
     )
     return success_response({"exported_file": str(exported)})
+
+
+# ==========================================
+# Direct Audio & Pitch/Tempo Editing Tools (Audacity-Style & Standalone DSP)
+# ==========================================
+
+def _resolve_audio_input(identifier: str, sess) -> Path:
+    p = Path(identifier).expanduser()
+    if p.exists() and p.is_file():
+        return resolve_safe_path(str(p), sess.config, must_exist=True)
+    if identifier in sess.library.tracks:
+        return sess.library.tracks[identifier].file_path
+    return resolve_safe_path(identifier, sess.config, must_exist=True)
+
+
+@handle_tool_errors
+def tool_audio_change_tempo(
+    input_file: str,
+    output_file: str,
+    target_bpm: Optional[float] = None,
+    tempo_change_percent: Optional[float] = None,
+    source_bpm: Optional[float] = None,
+    target_duration_sec: Optional[float] = None,
+    preserve_pitch: bool = True,
+    format: Optional[str] = None,
+    bit_depth: int = 24,
+) -> Dict[str, Any]:
+    sess = get_active_session()
+    safe_in = _resolve_audio_input(input_file, sess)
+    safe_out = resolve_safe_path(output_file, sess.config)
+
+    data, sr = sf.read(str(safe_in), always_2d=True, dtype="float32")
+    audio = data.T
+    orig_dur = audio.shape[1] / sr
+
+    applied_source_bpm = source_bpm
+    if target_bpm is not None:
+        if not applied_source_bpm:
+            analyzer = AudioAnalyzer(sess.config)
+            track_info = analyzer.analyze_track(safe_in)
+            applied_source_bpm = track_info.get("bpm", 120.0)
+        rate = float(target_bpm / applied_source_bpm) if applied_source_bpm > 0 else 1.0
+    elif tempo_change_percent is not None:
+        rate = float(1.0 + (tempo_change_percent / 100.0))
+    elif target_duration_sec is not None and target_duration_sec > 0:
+        rate = float(orig_dur / target_duration_sec)
+    else:
+        raise ValidationError("target_bpm", "Provide target_bpm, tempo_change_percent, or target_duration_sec.")
+
+    rb = RubberBandEngine()
+    if preserve_pitch:
+        processed = rb.time_stretch(audio, sr, rate=rate)
+    else:
+        processed = rb.change_speed(audio, sr, speed_ratio=rate)
+
+    exported = export_audio_to_file(
+        processed,
+        safe_out,
+        sample_rate=sr,
+        bit_depth=bit_depth,
+        audio_format=format,
+    )
+    final_dur = processed.shape[1] / sr
+    return success_response({
+        "output_file": str(exported),
+        "source_bpm": round(applied_source_bpm, 2) if applied_source_bpm else None,
+        "target_bpm": round(target_bpm, 2) if target_bpm else (round(applied_source_bpm * rate, 2) if applied_source_bpm else None),
+        "tempo_change_percent": round((rate - 1.0) * 100.0, 2),
+        "stretch_rate": round(rate, 4),
+        "original_duration_seconds": round(orig_dur, 3),
+        "final_duration_seconds": round(final_dur, 3),
+        "pitch_preserved": preserve_pitch,
+    })
+
+
+@handle_tool_errors
+def tool_audio_change_pitch(
+    input_file: str,
+    output_file: str,
+    semitones: Optional[float] = None,
+    cents: Optional[float] = None,
+    from_key: Optional[str] = None,
+    to_key: Optional[str] = None,
+    preserve_tempo: bool = True,
+    format: Optional[str] = None,
+    bit_depth: int = 24,
+) -> Dict[str, Any]:
+    sess = get_active_session()
+    safe_in = _resolve_audio_input(input_file, sess)
+    safe_out = resolve_safe_path(output_file, sess.config)
+
+    data, sr = sf.read(str(safe_in), always_2d=True, dtype="float32")
+    audio = data.T
+
+    shift = 0.0
+    detected_key = None
+    if semitones is not None:
+        shift = float(semitones)
+    elif cents is not None:
+        shift = float(cents) / 100.0
+    elif to_key is not None:
+        source_k = from_key
+        if not source_k:
+            analyzer = AudioAnalyzer(sess.config)
+            track_info = analyzer.analyze_track(safe_in)
+            source_k = track_info.get("key")
+            detected_key = source_k
+        if not source_k:
+            raise ValidationError("from_key", "Source key could not be detected. Please provide from_key explicitly.")
+        shift = calculate_key_semitone_shift(source_k, to_key)
+    else:
+        raise ValidationError("semitones", "Provide semitones, cents, or to_key.")
+
+    rb = RubberBandEngine()
+    if preserve_tempo:
+        processed = rb.pitch_shift(audio, sr, n_semitones=shift)
+    else:
+        speed_ratio = math.pow(2.0, shift / 12.0)
+        processed = rb.change_speed(audio, sr, speed_ratio=speed_ratio)
+
+    exported = export_audio_to_file(
+        processed,
+        safe_out,
+        sample_rate=sr,
+        bit_depth=bit_depth,
+        audio_format=format,
+    )
+    return success_response({
+        "output_file": str(exported),
+        "semitones_applied": round(shift, 2),
+        "source_key": from_key or detected_key,
+        "target_key": to_key,
+        "tempo_preserved": preserve_tempo,
+        "duration_seconds": round(processed.shape[1] / sr, 3),
+    })
+
+
+@handle_tool_errors
+def tool_audio_change_speed(
+    input_file: str,
+    output_file: str,
+    speed_ratio: Optional[float] = None,
+    speed_change_percent: Optional[float] = None,
+    from_rpm: Optional[float] = None,
+    to_rpm: Optional[float] = None,
+    format: Optional[str] = None,
+    bit_depth: int = 24,
+) -> Dict[str, Any]:
+    sess = get_active_session()
+    safe_in = _resolve_audio_input(input_file, sess)
+    safe_out = resolve_safe_path(output_file, sess.config)
+
+    data, sr = sf.read(str(safe_in), always_2d=True, dtype="float32")
+    audio = data.T
+
+    if speed_ratio is not None:
+        ratio = float(speed_ratio)
+    elif speed_change_percent is not None:
+        ratio = float(1.0 + (speed_change_percent / 100.0))
+    elif from_rpm is not None and to_rpm is not None and from_rpm > 0:
+        ratio = float(to_rpm / from_rpm)
+    else:
+        raise ValidationError("speed_ratio", "Provide speed_ratio, speed_change_percent, or from_rpm and to_rpm.")
+
+    rb = RubberBandEngine()
+    processed = rb.change_speed(audio, sr, speed_ratio=ratio)
+
+    exported = export_audio_to_file(
+        processed,
+        safe_out,
+        sample_rate=sr,
+        bit_depth=bit_depth,
+        audio_format=format,
+    )
+    return success_response({
+        "output_file": str(exported),
+        "speed_ratio": round(ratio, 4),
+        "speed_change_percent": round((ratio - 1.0) * 100.0, 2),
+        "pitch_shift_semitones": round(12.0 * math.log2(ratio), 2),
+        "duration_seconds": round(processed.shape[1] / sr, 3),
+    })
+
+
+@handle_tool_errors
+def tool_audio_paulstretch(
+    input_file: str,
+    output_file: str,
+    stretch_factor: float = 8.0,
+    window_size_sec: float = 0.25,
+    format: Optional[str] = None,
+    bit_depth: int = 24,
+) -> Dict[str, Any]:
+    sess = get_active_session()
+    safe_in = _resolve_audio_input(input_file, sess)
+    safe_out = resolve_safe_path(output_file, sess.config)
+
+    data, sr = sf.read(str(safe_in), always_2d=True, dtype="float32")
+    audio = data.T
+
+    rb = RubberBandEngine()
+    processed = rb.paulstretch(audio, sr, stretch_factor=stretch_factor, window_size_sec=window_size_sec)
+
+    exported = export_audio_to_file(
+        processed,
+        safe_out,
+        sample_rate=sr,
+        bit_depth=bit_depth,
+        audio_format=format,
+    )
+    return success_response({
+        "output_file": str(exported),
+        "stretch_factor": stretch_factor,
+        "window_size_sec": window_size_sec,
+        "duration_seconds": round(processed.shape[1] / sr, 3),
+    })
+
+
+@handle_tool_errors
+def tool_audio_reverse(
+    input_file: str,
+    output_file: str,
+    format: Optional[str] = None,
+    bit_depth: int = 24,
+) -> Dict[str, Any]:
+    sess = get_active_session()
+    safe_in = _resolve_audio_input(input_file, sess)
+    safe_out = resolve_safe_path(output_file, sess.config)
+
+    data, sr = sf.read(str(safe_in), always_2d=True, dtype="float32")
+    audio = np.flip(data.T, axis=-1)
+
+    exported = export_audio_to_file(
+        audio,
+        safe_out,
+        sample_rate=sr,
+        bit_depth=bit_depth,
+        audio_format=format,
+    )
+    return success_response({"output_file": str(exported), "duration_seconds": round(audio.shape[1] / sr, 3)})
+
+
+@handle_tool_errors
+def tool_audio_invert_polarity(
+    input_file: str,
+    output_file: str,
+    channels: str = "both",
+    format: Optional[str] = None,
+    bit_depth: int = 24,
+) -> Dict[str, Any]:
+    sess = get_active_session()
+    safe_in = _resolve_audio_input(input_file, sess)
+    safe_out = resolve_safe_path(output_file, sess.config)
+
+    data, sr = sf.read(str(safe_in), always_2d=True, dtype="float32")
+    audio = data.T.copy()
+    if channels == "both" or audio.ndim == 1 or audio.shape[0] == 1:
+        audio = -audio
+    elif channels == "left":
+        audio[0] = -audio[0]
+    elif channels == "right":
+        audio[1] = -audio[1]
+
+    exported = export_audio_to_file(
+        audio,
+        safe_out,
+        sample_rate=sr,
+        bit_depth=bit_depth,
+        audio_format=format,
+    )
+    return success_response({"output_file": str(exported), "inverted_channels": channels})
+
+
+@handle_tool_errors
+def tool_audio_truncate_silence(
+    input_file: str,
+    output_file: str,
+    threshold_db: float = -50.0,
+    min_silence_sec: float = 0.5,
+    truncate_to_sec: float = 0.0,
+    format: Optional[str] = None,
+    bit_depth: int = 24,
+) -> Dict[str, Any]:
+    sess = get_active_session()
+    safe_in = _resolve_audio_input(input_file, sess)
+    safe_out = resolve_safe_path(output_file, sess.config)
+
+    data, sr = sf.read(str(safe_in), always_2d=True, dtype="float32")
+    audio = data.T
+
+    rb = RubberBandEngine()
+    processed = rb.truncate_silence(
+        audio,
+        sr,
+        threshold_db=threshold_db,
+        min_silence_sec=min_silence_sec,
+        truncate_to_sec=truncate_to_sec,
+    )
+
+    exported = export_audio_to_file(
+        processed,
+        safe_out,
+        sample_rate=sr,
+        bit_depth=bit_depth,
+        audio_format=format,
+    )
+    return success_response({
+        "output_file": str(exported),
+        "original_duration_seconds": round(audio.shape[1] / sr, 3),
+        "final_duration_seconds": round(processed.shape[1] / sr, 3),
+        "removed_seconds": round((audio.shape[1] - processed.shape[1]) / sr, 3),
+    })
+
+
+@handle_tool_errors
+def tool_audio_denoise(
+    input_file: str,
+    output_file: str,
+    reduction_db: float = 12.0,
+    format: Optional[str] = None,
+    bit_depth: int = 24,
+) -> Dict[str, Any]:
+    sess = get_active_session()
+    safe_in = _resolve_audio_input(input_file, sess)
+    safe_out = resolve_safe_path(output_file, sess.config)
+
+    data, sr = sf.read(str(safe_in), always_2d=True, dtype="float32")
+    audio = data.T
+
+    rb = RubberBandEngine()
+    processed = rb.denoise(audio, sr, reduction_db=reduction_db)
+
+    exported = export_audio_to_file(
+        processed,
+        safe_out,
+        sample_rate=sr,
+        bit_depth=bit_depth,
+        audio_format=format,
+    )
+    return success_response({"output_file": str(exported), "reduction_db": reduction_db})
+
+
+@handle_tool_errors
+def tool_audio_declick(
+    input_file: str,
+    output_file: str,
+    sensitivity: float = 0.5,
+    format: Optional[str] = None,
+    bit_depth: int = 24,
+) -> Dict[str, Any]:
+    sess = get_active_session()
+    safe_in = _resolve_audio_input(input_file, sess)
+    safe_out = resolve_safe_path(output_file, sess.config)
+
+    data, sr = sf.read(str(safe_in), always_2d=True, dtype="float32")
+    audio = data.T
+
+    rb = RubberBandEngine()
+    processed = rb.declick(audio, sr, sensitivity=sensitivity)
+
+    exported = export_audio_to_file(
+        processed,
+        safe_out,
+        sample_rate=sr,
+        bit_depth=bit_depth,
+        audio_format=format,
+    )
+    return success_response({"output_file": str(exported), "sensitivity": sensitivity})
+
+
+@handle_tool_errors
+def tool_audio_vocal_remover(
+    input_file: str,
+    output_file: str,
+    mode: str = "remove_vocals",
+    low_cutoff_hz: float = 120.0,
+    high_cutoff_hz: float = 8000.0,
+    format: Optional[str] = None,
+    bit_depth: int = 24,
+) -> Dict[str, Any]:
+    sess = get_active_session()
+    safe_in = _resolve_audio_input(input_file, sess)
+    safe_out = resolve_safe_path(output_file, sess.config)
+
+    data, sr = sf.read(str(safe_in), always_2d=True, dtype="float32")
+    audio = data.T
+
+    rb = RubberBandEngine()
+    processed = rb.vocal_remover(audio, sr, mode=mode, low_cutoff_hz=low_cutoff_hz, high_cutoff_hz=high_cutoff_hz)
+
+    exported = export_audio_to_file(
+        processed,
+        safe_out,
+        sample_rate=sr,
+        bit_depth=bit_depth,
+        audio_format=format,
+    )
+    return success_response({"output_file": str(exported), "mode": mode})
+
+
+@handle_tool_errors
+def tool_timeline_set_tempo(bpm: float, stretch_clips: bool = True) -> Dict[str, Any]:
+    sess = get_active_session()
+    proj = sess.require_project()
+    old_bpm = proj.timeline.bpm
+    new_bpm = proj.timeline.set_tempo(bpm, stretch_clips=stretch_clips)
+    return success_response({
+        "old_bpm": old_bpm,
+        "new_bpm": new_bpm,
+        "clips_stretched": stretch_clips,
+        "total_tracks": len(proj.timeline.tracks),
+    })
+
+
+@handle_tool_errors
+def tool_timeline_get_tempo() -> Dict[str, Any]:
+    sess = get_active_session()
+    proj = sess.require_project()
+    return success_response({
+        "bpm": proj.timeline.bpm,
+        "time_signature": proj.timeline.time_signature,
+    })
 
 
 # ==========================================
@@ -1512,6 +2099,8 @@ TOOL_REGISTRY = {
     "stem_gain": tool_stem_gain,
     "stem_align": tool_stem_align,
     "stem_export": tool_stem_export,
+    "stems_merge": tool_stems_merge,
+    "audio_merge": tool_audio_merge,
     "master_analyze": tool_master_analyze,
     "master_process": tool_master_process,
     "master_normalize": tool_master_normalize,
@@ -1523,6 +2112,18 @@ TOOL_REGISTRY = {
     "render_stems": tool_render_stems,
     "render_project": tool_render_project,
     "export_audio": tool_export_audio,
+    "audio_change_tempo": tool_audio_change_tempo,
+    "audio_change_pitch": tool_audio_change_pitch,
+    "audio_change_speed": tool_audio_change_speed,
+    "audio_paulstretch": tool_audio_paulstretch,
+    "audio_reverse": tool_audio_reverse,
+    "audio_invert_polarity": tool_audio_invert_polarity,
+    "audio_truncate_silence": tool_audio_truncate_silence,
+    "audio_denoise": tool_audio_denoise,
+    "audio_declick": tool_audio_declick,
+    "audio_vocal_remover": tool_audio_vocal_remover,
+    "timeline_set_tempo": tool_timeline_set_tempo,
+    "timeline_get_tempo": tool_timeline_get_tempo,
     "job_status": tool_job_status,
     "job_cancel": tool_job_cancel,
     "job_result": tool_job_result,
