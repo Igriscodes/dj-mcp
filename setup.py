@@ -1,5 +1,8 @@
 import os
 import sys
+import site
+import urllib.request
+from pathlib import Path
 from setuptools import setup
 from setuptools.command.develop import develop
 from setuptools.command.install import install
@@ -20,18 +23,56 @@ def pre_download_ai_models():
     print("\n" + "=" * 65)
     print("DJ-MCP: Checking and pre-downloading AI separation models...")
     print("=" * 65)
+
+    # 1. Ensure host / virtualenv / user site-packages are visible even during pip build isolation
+    candidates = []
+    try:
+        candidates.append(site.getusersitepackages())
+    except Exception:
+        pass
+    try:
+        candidates.extend(site.getsitepackages())
+    except Exception:
+        pass
+
+    for base in [sys.prefix, sys.base_prefix, os.environ.get("CONDA_PREFIX"), os.environ.get("VIRTUAL_ENV")]:
+        if base:
+            p = Path(base) / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages"
+            candidates.append(str(p))
+
+    for c in candidates:
+        if c and os.path.isdir(c) and c not in sys.path:
+            sys.path.insert(0, c)
+
+    # 2. Try loading / downloading via Demucs official API if available
     try:
         from demucs.pretrained import get_model
-        print("Downloading / verifying Meta Demucs 'htdemucs' model...")
+        print("Verifying / downloading Meta Demucs 'htdemucs' model via demucs...")
         model = get_model("htdemucs")
-        print("✓ AI stem separation model 'htdemucs' is ready and cached locally.")
-    except ImportError:
-        print("Notice: 'demucs' is not installed in the active Python environment.")
-        print("To enable neural stem separation, install with: pip install '.[stems]'")
-        print("Then download models with: dj-mcp download-models")
+        print("✓ AI stem separation model 'htdemucs' is verified and cached locally.")
+        print("=" * 65 + "\n")
+        return
     except Exception as e:
-        print(f"Warning: Could not pre-download model during install: {e}")
-        print("You can download it anytime by running: dj-mcp download-models")
+        # Demucs not yet imported or network/hub issue
+        pass
+
+    # 3. Direct pre-download fallback to torch checkpoints cache (works with zero third-party deps)
+    try:
+        cache_dir = Path(os.environ.get("TORCH_HOME", "~/.cache/torch")).expanduser() / "hub" / "checkpoints"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        target = cache_dir / "955717e8-8726e21a.th"
+        url = "https://dl.fbaipublicfiles.com/demucs/hybrid_transformer/955717e8-8726e21a.th"
+
+        if target.exists() and target.stat().st_size > 80_000_000:
+            print(f"✓ AI stem separation model already present in {target}")
+        else:
+            print(f"Pre-downloading 'htdemucs' checkpoint to {target}...")
+            urllib.request.urlretrieve(url, target)
+            print("✓ AI stem separation model checkpoint downloaded successfully.")
+    except Exception as e:
+        print(f"Notice: Could not pre-download model during setup ({e}).")
+        print("The model will auto-download seamlessly on first use or via: dj-mcp download-models")
+
     print("=" * 65 + "\n")
 
 

@@ -5,10 +5,24 @@ from typing import Optional
 from pydantic import BaseModel, Field
 
 
+def _detect_default_workspace() -> Path:
+    if "DJ_WORKSPACE" in os.environ:
+        return Path(os.environ["DJ_WORKSPACE"]).expanduser().resolve()
+    cwd = Path.cwd().resolve()
+    cwd_str = str(cwd)
+    # If launched from inside an app or extension folder (e.g. LM Studio, VS Code, site-packages)
+    if any(k in cwd_str for k in [".lmstudio", "site-packages", ".vscode", "AppData"]):
+        music = Path.home() / "Music"
+        if music.exists():
+            return music
+        return Path.home()
+    return cwd
+
+
 class DJConfig(BaseModel):
-    workspace_dir: Path = Field(default_factory=lambda: Path(os.getcwd()).resolve())
-    cache_dir: Path = Field(default_factory=lambda: Path(os.getcwd()).resolve() / ".dj_cache")
-    temp_dir: Path = Field(default_factory=lambda: Path(os.getcwd()).resolve() / ".dj_temp")
+    workspace_dir: Path = Field(default_factory=_detect_default_workspace)
+    cache_dir: Path = Field(default_factory=lambda: Path.home() / ".dj_cache")
+    temp_dir: Path = Field(default_factory=lambda: Path.home() / ".dj_temp")
     sample_rate: int = Field(default=44100, ge=8000, le=192000)
     channels: int = Field(default=2, ge=1, le=8)
     bit_depth: int = Field(default=24, ge=16, le=32)
@@ -18,6 +32,8 @@ class DJConfig(BaseModel):
     use_gpu: bool = Field(default=True)
     strict_workspace: bool = Field(default=True)
     auto_backup: bool = Field(default=True)
+    default_export_format: str = Field(default="mp3")
+    default_bit_rate_kbps: int = Field(default=320, ge=64, le=320)
 
     def initialize_directories(self) -> None:
         self.workspace_dir.mkdir(parents=True, exist_ok=True)

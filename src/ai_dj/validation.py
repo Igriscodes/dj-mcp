@@ -9,12 +9,14 @@ def resolve_safe_path(
     config: Optional[DJConfig] = None,
     must_exist: bool = False,
     allow_absolute: bool = True,
+    base_dir: Optional[Path] = None,
 ) -> Path:
     cfg = config or get_default_config()
     path = Path(user_path).expanduser()
 
     if not path.is_absolute():
-        path = (cfg.workspace_dir / path).resolve()
+        anchor = base_dir or cfg.workspace_dir
+        path = (anchor / path).resolve()
     else:
         path = path.resolve()
 

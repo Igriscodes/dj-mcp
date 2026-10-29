@@ -77,6 +77,33 @@ def tool_available_plugins() -> Dict[str, Any]:
     })
 
 
+@handle_tool_errors
+def tool_workspace_get() -> Dict[str, Any]:
+    sess = get_active_session()
+    cfg = sess.config
+    return success_response({
+        "workspace_dir": str(cfg.workspace_dir),
+        "free_disk_space_mb": cfg.get_free_disk_space_mb(),
+        "default_export_format": cfg.default_export_format,
+        "default_bit_rate_kbps": cfg.default_bit_rate_kbps,
+        "sample_rate": cfg.sample_rate,
+        "channels": cfg.channels,
+    })
+
+
+@handle_tool_errors
+def tool_workspace_set(directory: str) -> Dict[str, Any]:
+    sess = get_active_session()
+    target = Path(directory).expanduser().resolve()
+    target.mkdir(parents=True, exist_ok=True)
+    sess.config.workspace_dir = target
+    return success_response({
+        "status": "updated",
+        "active_workspace_dir": str(target),
+        "free_disk_space_mb": sess.config.get_free_disk_space_mb(),
+    })
+
+
 # ==========================================
 # Project Tools
 # ==========================================
@@ -1101,21 +1128,71 @@ def tool_analyze_transients(file_path: str) -> Dict[str, Any]:
     return success_response({"transient_count": len(onsets), "transient_times_sec": [round(float(t), 4) for t in onsets[:64]]})
 
 
+def _resolve_audio_input(identifier: str, sess) -> Path:
+    p = Path(identifier).expanduser()
+    if p.exists() and p.is_file():
+        return resolve_safe_path(str(p), sess.config, must_exist=True)
+    if sess.library and identifier in sess.library.tracks:
+        return sess.library.tracks[identifier].file_path
+    return resolve_safe_path(identifier, sess.config, must_exist=True)
+
+
+def _resolve_multi_audio_inputs(input_val: Any, sess) -> List[Path]:
+    audio_exts = {".wav", ".mp3", ".flac", ".ogg", ".aiff", ".aif", ".m4a", ".aac", ".opus", ".wma"}
+    resolved: List[Path] = []
+
+    if isinstance(input_val, str):
+        clean_str = input_val.strip()
+        p = Path(clean_str).expanduser()
+        if not p.is_absolute():
+            cand = (sess.config.workspace_dir / p).resolve()
+            if cand.exists():
+                p = cand
+            elif Path(clean_str).exists():
+                p = Path(clean_str).resolve()
+
+        if p.is_dir():
+            resolved = [f for f in sorted(p.iterdir()) if f.is_file() and f.suffix.lower() in audio_exts]
+        elif "," in clean_str:
+            for item in clean_str.split(","):
+                item_str = item.strip()
+                if item_str:
+                    resolved.extend(_resolve_multi_audio_inputs(item_str, sess))
+        else:
+            resolved = [_resolve_audio_input(clean_str, sess)]
+    elif isinstance(input_val, (list, tuple)):
+        for item in input_val:
+            resolved.extend(_resolve_multi_audio_inputs(item, sess))
+    else:
+        raise ValidationError("input_files", f"Invalid input files parameter: {type(input_val)}")
+
+    seen = set()
+    deduped = []
+    for r in resolved:
+        if r not in seen:
+            seen.add(r)
+            deduped.append(r)
+    return deduped
+
+
 # ==========================================
 # Stem Operations Tools
 # ==========================================
 
 @handle_tool_errors
 def tool_separate_stems(
-    audio_path: str,
+    audio_path: Any,
     output_dir: Optional[str] = None,
     model_name: str = "htdemucs",
     device: Optional[str] = None,
+    format: str = "mp3",
+    bit_rate_kbps: int = 320,
     wait: bool = True,
 ) -> Dict[str, Any]:
     sess = get_active_session()
-    safe_audio = resolve_safe_path(audio_path, sess.config, must_exist=True)
-    out_dir = resolve_safe_path(output_dir or f"stems_{safe_audio.stem}", sess.config)
+    resolved_inputs = _resolve_multi_audio_inputs(audio_path, sess)
+    if not resolved_inputs:
+        raise ValidationError("audio_path", "No valid audio files found to separate.")
 
     sep = SeparationEngine(model_name=model_name)
     if not sep.is_available:
@@ -1126,42 +1203,86 @@ def tool_separate_stems(
             suggested_tool="system_capabilities",
         )
 
-    if wait:
-        res_paths = sep.separate(safe_audio, out_dir, device=device)
+    # 1. Single audio file separation
+    if len(resolved_inputs) == 1:
+        safe_audio = resolved_inputs[0]
+        if output_dir:
+            out_p = Path(output_dir).expanduser()
+            if not out_p.is_absolute():
+                out_dir = (safe_audio.parent / out_p).resolve()
+            else:
+                out_dir = out_p.resolve()
+        else:
+            # Default directly alongside the song file (e.g. /home/igris/Music/stems_song/)
+            out_dir = (safe_audio.parent / f"stems_{safe_audio.stem}").resolve()
+
+        if wait:
+            res_paths = sep.separate(safe_audio, out_dir, device=device, format=format, bit_rate_kbps=bit_rate_kbps)
+            stems_dict = {k: str(v) for k, v in res_paths.items()}
+            if sess.current_project:
+                from ai_dj.stems import StemSet
+                s_set = StemSet(
+                    set_id=f"stems_{safe_audio.stem}",
+                    source_file=safe_audio,
+                    model_used=model_name,
+                    stems=res_paths,
+                )
+                sess.current_project.stems[s_set.set_id] = s_set
+
+            warnings = []
+            if sep.fallback_occurred:
+                import os
+                warnings.append(
+                    f"CUDA Out of Memory on GPU (VRAM occupied by LLMs or other workloads). Automatically shifted to CPU using all {os.cpu_count()} cores at full performance."
+                )
+
+            return success_response({
+                "status": "completed",
+                "output_directory": str(out_dir),
+                "stems": stems_dict,
+                "format": format,
+                "model_used": model_name,
+                "device_used": sep.last_device_used,
+                "fallback_to_cpu": sep.fallback_occurred,
+                "stems_count": len(stems_dict),
+            }, warnings=warnings)
+
+        # Run separation as background job
+        def job_fn():
+            return sep.separate(safe_audio, out_dir, device=device, format=format, bit_rate_kbps=bit_rate_kbps)
+
+        job_id = sess.job_manager.submit_job(f"Stem Separation: {safe_audio.name}", job_fn)
+        return job_response(job_id)
+
+    # 2. Multiple audio files / batch folder separation
+    base_out = Path(output_dir).expanduser().resolve() if output_dir else None
+    batch_results = []
+    warnings = []
+    for safe_audio in resolved_inputs:
+        if base_out:
+            file_out_dir = base_out / f"stems_{safe_audio.stem}"
+        else:
+            file_out_dir = safe_audio.parent / f"stems_{safe_audio.stem}"
+
+        res_paths = sep.separate(safe_audio, file_out_dir, device=device, format=format, bit_rate_kbps=bit_rate_kbps)
         stems_dict = {k: str(v) for k, v in res_paths.items()}
-        if sess.current_project:
-            from ai_dj.stems import StemSet
-            s_set = StemSet(
-                set_id=f"stems_{safe_audio.stem}",
-                source_file=safe_audio,
-                model_used=model_name,
-                stems=res_paths,
-            )
-            sess.current_project.stems[s_set.set_id] = s_set
-
-        warnings = []
-        if sep.fallback_occurred:
-            import os
-            warnings.append(
-                f"CUDA Out of Memory on GPU (VRAM occupied by LLMs or other workloads). Automatically shifted to CPU using all {os.cpu_count()} cores at full performance."
-            )
-
-        return success_response({
-            "status": "completed",
-            "output_directory": str(out_dir),
+        batch_results.append({
+            "audio_file": str(safe_audio),
+            "output_directory": str(file_out_dir),
             "stems": stems_dict,
-            "model_used": model_name,
-            "device_used": sep.last_device_used,
-            "fallback_to_cpu": sep.fallback_occurred,
-            "stems_count": len(stems_dict),
-        }, warnings=warnings)
+        })
+        if sep.fallback_occurred and "CUDA Out of Memory" not in " ".join(warnings):
+            import os
+            warnings.append(f"CUDA Out of Memory on GPU. Processed on CPU using all {os.cpu_count()} cores.")
 
-    # Run separation as background job
-    def job_fn():
-        return sep.separate(safe_audio, out_dir, device=device)
-
-    job_id = sess.job_manager.submit_job(f"Stem Separation: {safe_audio.name}", job_fn)
-    return job_response(job_id)
+    return success_response({
+        "status": "completed",
+        "tracks_separated": len(batch_results),
+        "results": batch_results,
+        "format": format,
+        "model_used": model_name,
+        "device_used": sep.last_device_used,
+    }, warnings=warnings)
 
 
 @handle_tool_errors
@@ -1217,7 +1338,7 @@ def tool_stem_align(set_id: str, stem_name: str, offset_sec: float) -> Dict[str,
 
 
 @handle_tool_errors
-def tool_stem_export(set_id: str, output_path: str) -> Dict[str, Any]:
+def tool_stem_export(set_id: str, output_path: str, format: Optional[str] = None, bit_rate_kbps: int = 320) -> Dict[str, Any]:
     sess = get_active_session()
     proj = sess.require_project()
     if set_id not in proj.stems:
@@ -1225,7 +1346,13 @@ def tool_stem_export(set_id: str, output_path: str) -> Dict[str, Any]:
     stems = proj.stems[set_id]
     recombined = stems.recombine(proj.sample_rate)
     target = resolve_safe_path(output_path, sess.config)
-    exported = export_audio_to_file(recombined, target, sample_rate=proj.sample_rate)
+    exported = export_audio_to_file(
+        recombined,
+        target,
+        sample_rate=proj.sample_rate,
+        audio_format=format or (None if target.suffix else sess.config.default_export_format),
+        bit_rate_kbps=bit_rate_kbps,
+    )
     return success_response({"exported_file": str(exported)})
 
 
@@ -1239,6 +1366,7 @@ def tool_audio_merge(
     target_peak_dbfs: float = -0.5,
     format: Optional[str] = None,
     bit_depth: int = 24,
+    bit_rate_kbps: int = 320,
 ) -> Dict[str, Any]:
     sess = get_active_session()
     target_out = resolve_safe_path(output_file, sess.config)
@@ -1309,12 +1437,17 @@ def tool_audio_merge(
         target_lin = 10.0 ** (target_peak_dbfs / 20.0)
         summed = summed * (target_lin / peak)
 
+    eff_format = format
+    if eff_format is None and not target_out.suffix:
+        eff_format = sess.config.default_export_format
+
     exported = export_audio_to_file(
         summed,
         target_out,
         sample_rate=target_sr,
         bit_depth=bit_depth,
-        audio_format=format,
+        audio_format=eff_format,
+        bit_rate_kbps=bit_rate_kbps,
     )
 
     final_peak = float(np.max(np.abs(summed))) if summed.size > 0 else 0.0
@@ -1423,6 +1556,7 @@ def tool_render_project(
     end_sec: Optional[float] = None,
     format: Optional[str] = None,
     bit_depth: int = 24,
+    bit_rate_kbps: int = 320,
 ) -> Dict[str, Any]:
     sess = get_active_session()
     proj = sess.require_project()
@@ -1435,9 +1569,21 @@ def tool_render_project(
         end_sec=end_sec,
         sample_rate=proj.sample_rate,
     )
-    exported = export_audio_to_file(audio, target, sample_rate=proj.sample_rate, bit_depth=bit_depth, audio_format=format)
+    eff_format = format
+    if eff_format is None and not target.suffix:
+        eff_format = sess.config.default_export_format
+
+    exported = export_audio_to_file(
+        audio,
+        target,
+        sample_rate=proj.sample_rate,
+        bit_depth=bit_depth,
+        audio_format=eff_format,
+        bit_rate_kbps=bit_rate_kbps,
+    )
     return success_response({
         "rendered_file": str(exported),
+        "format": exported.suffix.lstrip(".").lower(),
         "duration_seconds": round(audio.shape[1] / proj.sample_rate, 3),
         "channels": audio.shape[0],
     })
@@ -1448,13 +1594,21 @@ def tool_render_preview(
     output_path: str,
     start_sec: float = 0.0,
     duration_sec: float = 15.0,
+    format: Optional[str] = None,
+    bit_rate_kbps: int = 320,
 ) -> Dict[str, Any]:
-    return tool_render_project(output_path, start_sec=start_sec, end_sec=start_sec + duration_sec)
+    return tool_render_project(output_path, start_sec=start_sec, end_sec=start_sec + duration_sec, format=format, bit_rate_kbps=bit_rate_kbps)
 
 
 @handle_tool_errors
-def tool_render_region(output_path: str, start_sec: float, end_sec: float) -> Dict[str, Any]:
-    return tool_render_project(output_path, start_sec=start_sec, end_sec=end_sec)
+def tool_render_region(
+    output_path: str,
+    start_sec: float,
+    end_sec: float,
+    format: Optional[str] = None,
+    bit_rate_kbps: int = 320,
+) -> Dict[str, Any]:
+    return tool_render_project(output_path, start_sec=start_sec, end_sec=end_sec, format=format, bit_rate_kbps=bit_rate_kbps)
 
 
 @handle_tool_errors
@@ -1490,23 +1644,302 @@ def tool_export_audio(
     return success_response({"exported_file": str(exported)})
 
 
+@handle_tool_errors
+def tool_audio_convert_format(
+    input_file: Any,
+    output_file: Optional[str] = None,
+    target_format: str = "mp3",
+    bit_rate_kbps: int = 320,
+    sample_rate: Optional[int] = None,
+    channels: Optional[int] = None,
+    bit_depth: Optional[int] = None,
+    overwrite: bool = True,
+    delete_source: bool = False,
+) -> Dict[str, Any]:
+    sess = get_active_session()
+    ffmpeg = FFmpegEngine()
+    ffmpeg.require_available()
+
+    clean_fmt = target_format.lower().lstrip(".")
+    codec_override = None
+    target_ext = f".{clean_fmt}"
+    if clean_fmt in ("alac", "m4a_alac"):
+        codec_override = "alac"
+        target_ext = ".m4a"
+
+    audio_exts = {".wav", ".mp3", ".flac", ".ogg", ".aiff", ".aif", ".m4a", ".aac", ".opus", ".wma"}
+
+    resolved_inputs: List[Path] = []
+    is_batch = False
+
+    if isinstance(input_file, str):
+        clean_str = input_file.strip()
+        p = Path(clean_str).expanduser()
+        if p.is_dir():
+            is_batch = True
+            resolved_inputs = [f for f in sorted(p.iterdir()) if f.is_file() and f.suffix.lower() in audio_exts and f.suffix.lower() != target_ext]
+            if not resolved_inputs:
+                resolved_inputs = [f for f in sorted(p.iterdir()) if f.is_file() and f.suffix.lower() in audio_exts]
+        elif "," in clean_str:
+            is_batch = True
+            resolved_inputs = [resolve_safe_path(x.strip(), sess.config, must_exist=True) for x in clean_str.split(",") if x.strip()]
+        else:
+            resolved_inputs = [resolve_safe_path(clean_str, sess.config, must_exist=True)]
+    elif isinstance(input_file, (list, tuple)):
+        is_batch = True
+        resolved_inputs = [resolve_safe_path(str(x), sess.config, must_exist=True) for x in input_file]
+    else:
+        raise ValidationError("input_file", "input_file must be a file path, directory path, or list of paths.")
+
+    if not resolved_inputs:
+        raise ValidationError("input_file", "No valid audio files found to convert.")
+
+    if not is_batch and len(resolved_inputs) == 1:
+        safe_in = resolved_inputs[0]
+        if output_file:
+            safe_out = resolve_safe_path(output_file, sess.config)
+            if not safe_out.suffix:
+                safe_out = safe_out.with_suffix(target_ext)
+        else:
+            safe_out = safe_in.with_suffix(target_ext)
+            if safe_out == safe_in:
+                safe_out = safe_in.parent / f"{safe_in.stem}_converted{target_ext}"
+
+        orig_size = safe_in.stat().st_size
+        exported = ffmpeg.convert(
+            input_path=safe_in,
+            output_path=safe_out,
+            sample_rate=sample_rate,
+            channels=channels,
+            bit_depth=bit_depth,
+            codec=codec_override,
+            bit_rate_kbps=bit_rate_kbps,
+            overwrite=overwrite,
+        )
+        new_size = exported.stat().st_size
+        space_saved = max(0, orig_size - new_size)
+        reduction_pct = round((space_saved / orig_size) * 100.0, 1) if orig_size > 0 else 0.0
+
+        if delete_source and safe_in != exported and exported.exists() and new_size > 0:
+            try:
+                safe_in.unlink()
+            except Exception:
+                pass
+
+        try:
+            probe_meta = ffmpeg.probe(exported)
+        except Exception:
+            probe_meta = {}
+
+        return success_response({
+            "input_file": str(safe_in),
+            "output_file": str(exported),
+            "target_format": clean_fmt,
+            "bit_rate_kbps": bit_rate_kbps if clean_fmt in ("mp3", "aac", "m4a", "ogg", "opus") else None,
+            "original_size_mb": round(orig_size / (1024 * 1024), 2),
+            "converted_size_mb": round(new_size / (1024 * 1024), 2),
+            "space_saved_mb": round(space_saved / (1024 * 1024), 2),
+            "compression_ratio": f"{reduction_pct}% reduction",
+            "duration_seconds": probe_meta.get("duration_seconds"),
+            "sample_rate": probe_meta.get("sample_rate", sample_rate),
+            "channels": probe_meta.get("channels", channels),
+        })
+
+    # Batch directory or multiple files
+    out_dir = None
+    if output_file:
+        out_p = Path(output_file).expanduser()
+        if out_p.is_dir() or not out_p.suffix:
+            out_dir = resolve_safe_path(output_file, sess.config)
+            out_dir.mkdir(parents=True, exist_ok=True)
+
+    results = []
+    total_orig = 0
+    total_new = 0
+    for f in resolved_inputs:
+        target_dir = out_dir or f.parent
+        dest = target_dir / f"{f.stem}{target_ext}"
+        if dest == f:
+            dest = target_dir / f"{f.stem}_converted{target_ext}"
+
+        orig_s = f.stat().st_size
+        total_orig += orig_s
+        exp = ffmpeg.convert(
+            input_path=f,
+            output_path=dest,
+            sample_rate=sample_rate,
+            channels=channels,
+            bit_depth=bit_depth,
+            codec=codec_override,
+            bit_rate_kbps=bit_rate_kbps,
+            overwrite=overwrite,
+        )
+        new_s = exp.stat().st_size
+        total_new += new_s
+
+        if delete_source and f != exp and exp.exists() and new_s > 0:
+            try:
+                f.unlink()
+            except Exception:
+                pass
+
+        saved = max(0, orig_s - new_s)
+        results.append({
+            "input_file": str(f),
+            "output_file": str(exp),
+            "original_size_mb": round(orig_s / (1024 * 1024), 2),
+            "converted_size_mb": round(new_s / (1024 * 1024), 2),
+            "space_saved_mb": round(saved / (1024 * 1024), 2),
+        })
+
+    total_saved = max(0, total_orig - total_new)
+    total_pct = round((total_saved / total_orig) * 100.0, 1) if total_orig > 0 else 0.0
+
+    return success_response({
+        "files_converted_count": len(results),
+        "target_format": clean_fmt,
+        "total_original_mb": round(total_orig / (1024 * 1024), 2),
+        "total_converted_mb": round(total_new / (1024 * 1024), 2),
+        "total_space_saved_mb": round(total_saved / (1024 * 1024), 2),
+        "compression_ratio": f"{total_pct}% reduction",
+        "conversions": results,
+    })
+
+
 # ==========================================
-# Direct Audio & Pitch/Tempo Editing Tools (Audacity-Style & Standalone DSP)
+# Direct Audio & Pitch/Tempo/Effects Editing Tools (Audacity-Style & Standalone DSP)
 # ==========================================
 
-def _resolve_audio_input(identifier: str, sess) -> Path:
-    p = Path(identifier).expanduser()
-    if p.exists() and p.is_file():
-        return resolve_safe_path(str(p), sess.config, must_exist=True)
-    if identifier in sess.library.tracks:
-        return sess.library.tracks[identifier].file_path
-    return resolve_safe_path(identifier, sess.config, must_exist=True)
+@handle_tool_errors
+def tool_audio_apply_effect(
+    input_files: Any,
+    effect_type: str = "reverb",
+    output_dir: Optional[str] = None,
+    output_file: Optional[str] = None,
+    parameters: Optional[Dict[str, Any]] = None,
+    format: Optional[str] = None,
+    bit_rate_kbps: int = 320,
+    overwrite: bool = True,
+) -> Dict[str, Any]:
+    sess = get_active_session()
+    resolved_inputs = _resolve_multi_audio_inputs(input_files, sess)
+    if not resolved_inputs:
+        raise ValidationError("input_files", "No valid audio files found to process.")
+
+    params = parameters or {}
+    eff_type_lower = effect_type.lower()
+    chain = EffectChain([
+        EffectConfig(
+            effect_id=f"fx_{eff_type_lower}",
+            effect_type=eff_type_lower,
+            parameters=params,
+        )
+    ])
+
+    out_base_dir = None
+    if output_dir:
+        out_base_dir = Path(output_dir).expanduser().resolve()
+        out_base_dir.mkdir(parents=True, exist_ok=True)
+
+    # Single file with explicit output_file
+    if len(resolved_inputs) == 1 and output_file:
+        safe_in = resolved_inputs[0]
+        safe_out = resolve_safe_path(output_file, sess.config, base_dir=safe_in.parent)
+        data, sr = sf.read(str(safe_in), always_2d=True, dtype="float32")
+        processed = chain.process(data.T, sr)
+        exported = export_audio_to_file(
+            processed,
+            safe_out,
+            sample_rate=sr,
+            audio_format=format or (safe_out.suffix.lstrip(".") if safe_out.suffix else sess.config.default_export_format),
+            bit_rate_kbps=bit_rate_kbps,
+            overwrite=overwrite,
+        )
+        return success_response({
+            "input_file": str(safe_in),
+            "output_file": str(exported),
+            "effect_applied": eff_type_lower,
+            "parameters": params,
+            "duration_seconds": round(processed.shape[1] / sr, 3),
+        })
+
+    results = []
+    for f in resolved_inputs:
+        data, sr = sf.read(str(f), always_2d=True, dtype="float32")
+        processed = chain.process(data.T, sr)
+        target_dir = out_base_dir or f.parent
+        target_ext = f".{format.lower().lstrip('.')}" if format else f.suffix
+        dest_file = target_dir / f"{f.stem}_{eff_type_lower}{target_ext}"
+        exported = export_audio_to_file(
+            processed,
+            dest_file,
+            sample_rate=sr,
+            audio_format=format or dest_file.suffix.lstrip("."),
+            bit_rate_kbps=bit_rate_kbps,
+            overwrite=overwrite,
+        )
+        results.append({
+            "input_file": str(f),
+            "output_file": str(exported),
+            "duration_seconds": round(processed.shape[1] / sr, 3),
+        })
+
+    if len(results) == 1 and not output_dir and not isinstance(input_files, (list, tuple)) and "," not in str(input_files):
+        res = results[0]
+        return success_response({
+            "input_file": res["input_file"],
+            "output_file": res["output_file"],
+            "effect_applied": eff_type_lower,
+            "parameters": params,
+            "duration_seconds": res["duration_seconds"],
+        })
+
+    return success_response({
+        "files_processed_count": len(results),
+        "effect_applied": eff_type_lower,
+        "parameters": params,
+        "results": results,
+    })
+
+
+@handle_tool_errors
+def tool_audio_reverb(
+    input_files: Any,
+    output_dir: Optional[str] = None,
+    output_file: Optional[str] = None,
+    room_size: float = 0.5,
+    damping: float = 0.5,
+    wet_level: float = 0.33,
+    dry_level: float = 0.67,
+    width: float = 1.0,
+    format: Optional[str] = None,
+    bit_rate_kbps: int = 320,
+    overwrite: bool = True,
+) -> Dict[str, Any]:
+    params = {
+        "room_size": room_size,
+        "damping": damping,
+        "wet_level": wet_level,
+        "dry_level": dry_level,
+        "width": width,
+    }
+    return tool_audio_apply_effect(
+        input_files=input_files,
+        effect_type="reverb",
+        output_dir=output_dir,
+        output_file=output_file,
+        parameters=params,
+        format=format,
+        bit_rate_kbps=bit_rate_kbps,
+        overwrite=overwrite,
+    )
 
 
 @handle_tool_errors
 def tool_audio_change_tempo(
-    input_file: str,
-    output_file: str,
+    input_file: Any,
+    output_file: Optional[str] = None,
+    output_dir: Optional[str] = None,
     target_bpm: Optional[float] = None,
     tempo_change_percent: Optional[float] = None,
     source_bpm: Optional[float] = None,
@@ -1516,57 +1949,120 @@ def tool_audio_change_tempo(
     bit_depth: int = 24,
 ) -> Dict[str, Any]:
     sess = get_active_session()
-    safe_in = _resolve_audio_input(input_file, sess)
-    safe_out = resolve_safe_path(output_file, sess.config)
-
-    data, sr = sf.read(str(safe_in), always_2d=True, dtype="float32")
-    audio = data.T
-    orig_dur = audio.shape[1] / sr
-
-    applied_source_bpm = source_bpm
-    if target_bpm is not None:
-        if not applied_source_bpm:
-            analyzer = AudioAnalyzer(sess.config)
-            track_info = analyzer.analyze_track(safe_in)
-            applied_source_bpm = track_info.get("bpm", 120.0)
-        rate = float(target_bpm / applied_source_bpm) if applied_source_bpm > 0 else 1.0
-    elif tempo_change_percent is not None:
-        rate = float(1.0 + (tempo_change_percent / 100.0))
-    elif target_duration_sec is not None and target_duration_sec > 0:
-        rate = float(orig_dur / target_duration_sec)
-    else:
-        raise ValidationError("target_bpm", "Provide target_bpm, tempo_change_percent, or target_duration_sec.")
+    resolved_inputs = _resolve_multi_audio_inputs(input_file, sess)
+    if not resolved_inputs:
+        raise ValidationError("input_file", "No valid audio files found.")
 
     rb = RubberBandEngine()
-    if preserve_pitch:
-        processed = rb.time_stretch(audio, sr, rate=rate)
-    else:
-        processed = rb.change_speed(audio, sr, speed_ratio=rate)
 
-    exported = export_audio_to_file(
-        processed,
-        safe_out,
-        sample_rate=sr,
-        bit_depth=bit_depth,
-        audio_format=format,
-    )
-    final_dur = processed.shape[1] / sr
+    # Single file with explicit output_file
+    if len(resolved_inputs) == 1 and output_file:
+        safe_in = resolved_inputs[0]
+        safe_out = resolve_safe_path(output_file, sess.config, base_dir=safe_in.parent)
+
+        data, sr = sf.read(str(safe_in), always_2d=True, dtype="float32")
+        audio = data.T
+        orig_dur = audio.shape[1] / sr
+
+        applied_source_bpm = source_bpm
+        if target_bpm is not None:
+            if not applied_source_bpm:
+                analyzer = AudioAnalyzer(sess.config)
+                track_info = analyzer.analyze_track(safe_in)
+                applied_source_bpm = track_info.get("bpm", 120.0)
+            rate = float(target_bpm / applied_source_bpm) if applied_source_bpm > 0 else 1.0
+        elif tempo_change_percent is not None:
+            rate = float(1.0 + (tempo_change_percent / 100.0))
+        elif target_duration_sec is not None and target_duration_sec > 0:
+            rate = float(orig_dur / target_duration_sec)
+        else:
+            raise ValidationError("target_bpm", "Provide target_bpm, tempo_change_percent, or target_duration_sec.")
+
+        if preserve_pitch:
+            processed = rb.time_stretch(audio, sr, rate=rate)
+        else:
+            processed = rb.change_speed(audio, sr, speed_ratio=rate)
+
+        exported = export_audio_to_file(
+            processed,
+            safe_out,
+            sample_rate=sr,
+            bit_depth=bit_depth,
+            audio_format=format,
+        )
+        final_dur = processed.shape[1] / sr
+        return success_response({
+            "output_file": str(exported),
+            "source_bpm": round(applied_source_bpm, 2) if applied_source_bpm else None,
+            "target_bpm": round(target_bpm, 2) if target_bpm else (round(applied_source_bpm * rate, 2) if applied_source_bpm else None),
+            "tempo_change_percent": round((rate - 1.0) * 100.0, 2),
+            "stretch_rate": round(rate, 4),
+            "original_duration_seconds": round(orig_dur, 3),
+            "final_duration_seconds": round(final_dur, 3),
+            "pitch_preserved": preserve_pitch,
+        })
+
+    # Multiple files / batch folder
+    out_base = Path(output_dir).expanduser().resolve() if output_dir else None
+    if out_base:
+        out_base.mkdir(parents=True, exist_ok=True)
+
+    results = []
+    for safe_in in resolved_inputs:
+        data, sr = sf.read(str(safe_in), always_2d=True, dtype="float32")
+        audio = data.T
+        orig_dur = audio.shape[1] / sr
+
+        applied_source_bpm = source_bpm
+        if target_bpm is not None:
+            if not applied_source_bpm:
+                analyzer = AudioAnalyzer(sess.config)
+                track_info = analyzer.analyze_track(safe_in)
+                applied_source_bpm = track_info.get("bpm", 120.0)
+            rate = float(target_bpm / applied_source_bpm) if applied_source_bpm > 0 else 1.0
+        elif tempo_change_percent is not None:
+            rate = float(1.0 + (tempo_change_percent / 100.0))
+        elif target_duration_sec is not None and target_duration_sec > 0:
+            rate = float(orig_dur / target_duration_sec)
+        else:
+            raise ValidationError("target_bpm", "Provide target_bpm, tempo_change_percent, or target_duration_sec.")
+
+        if preserve_pitch:
+            processed = rb.time_stretch(audio, sr, rate=rate)
+        else:
+            processed = rb.change_speed(audio, sr, speed_ratio=rate)
+
+        target_dir = out_base or safe_in.parent
+        target_ext = f".{format.lower().lstrip('.')}" if format else safe_in.suffix
+        bpm_str = round(target_bpm or (applied_source_bpm * rate if applied_source_bpm else 120.0), 1)
+        dest_file = target_dir / f"{safe_in.stem}_{bpm_str}bpm{target_ext}"
+
+        exported = export_audio_to_file(
+            processed,
+            dest_file,
+            sample_rate=sr,
+            bit_depth=bit_depth,
+            audio_format=format or dest_file.suffix.lstrip("."),
+        )
+        results.append({
+            "input_file": str(safe_in),
+            "output_file": str(exported),
+            "stretch_rate": round(rate, 4),
+            "final_duration_seconds": round(processed.shape[1] / sr, 3),
+        })
+
     return success_response({
-        "output_file": str(exported),
-        "source_bpm": round(applied_source_bpm, 2) if applied_source_bpm else None,
-        "target_bpm": round(target_bpm, 2) if target_bpm else (round(applied_source_bpm * rate, 2) if applied_source_bpm else None),
-        "tempo_change_percent": round((rate - 1.0) * 100.0, 2),
-        "stretch_rate": round(rate, 4),
-        "original_duration_seconds": round(orig_dur, 3),
-        "final_duration_seconds": round(final_dur, 3),
-        "pitch_preserved": preserve_pitch,
+        "files_processed_count": len(results),
+        "target_bpm": target_bpm,
+        "results": results,
     })
 
 
 @handle_tool_errors
 def tool_audio_change_pitch(
-    input_file: str,
-    output_file: str,
+    input_file: Any,
+    output_file: Optional[str] = None,
+    output_dir: Optional[str] = None,
     semitones: Optional[float] = None,
     cents: Optional[float] = None,
     from_key: Optional[str] = None,
@@ -1576,52 +2072,111 @@ def tool_audio_change_pitch(
     bit_depth: int = 24,
 ) -> Dict[str, Any]:
     sess = get_active_session()
-    safe_in = _resolve_audio_input(input_file, sess)
-    safe_out = resolve_safe_path(output_file, sess.config)
-
-    data, sr = sf.read(str(safe_in), always_2d=True, dtype="float32")
-    audio = data.T
+    resolved_inputs = _resolve_multi_audio_inputs(input_file, sess)
+    if not resolved_inputs:
+        raise ValidationError("input_file", "No valid audio files found.")
 
     shift = 0.0
-    detected_key = None
     if semitones is not None:
         shift = float(semitones)
     elif cents is not None:
         shift = float(cents) / 100.0
     elif to_key is not None:
-        source_k = from_key
-        if not source_k:
-            analyzer = AudioAnalyzer(sess.config)
-            track_info = analyzer.analyze_track(safe_in)
-            source_k = track_info.get("key")
-            detected_key = source_k
-        if not source_k:
-            raise ValidationError("from_key", "Source key could not be detected. Please provide from_key explicitly.")
-        shift = calculate_key_semitone_shift(source_k, to_key)
+        if from_key:
+            shift = calculate_key_semitone_shift(from_key, to_key)
     else:
         raise ValidationError("semitones", "Provide semitones, cents, or to_key.")
 
     rb = RubberBandEngine()
-    if preserve_tempo:
-        processed = rb.pitch_shift(audio, sr, n_semitones=shift)
-    else:
-        speed_ratio = math.pow(2.0, shift / 12.0)
-        processed = rb.change_speed(audio, sr, speed_ratio=speed_ratio)
 
-    exported = export_audio_to_file(
-        processed,
-        safe_out,
-        sample_rate=sr,
-        bit_depth=bit_depth,
-        audio_format=format,
-    )
+    # Single file with explicit output_file
+    if len(resolved_inputs) == 1 and output_file:
+        safe_in = resolved_inputs[0]
+        safe_out = resolve_safe_path(output_file, sess.config, base_dir=safe_in.parent)
+
+        data, sr = sf.read(str(safe_in), always_2d=True, dtype="float32")
+        audio = data.T
+
+        current_shift = shift
+        detected_key = None
+        if to_key is not None and not from_key:
+            analyzer = AudioAnalyzer(sess.config)
+            track_info = analyzer.analyze_track(safe_in)
+            detected_key = track_info.get("key")
+            if not detected_key:
+                raise ValidationError("from_key", "Source key could not be detected. Please provide from_key explicitly.")
+            current_shift = calculate_key_semitone_shift(detected_key, to_key)
+
+        if preserve_tempo:
+            processed = rb.pitch_shift(audio, sr, n_semitones=current_shift)
+        else:
+            speed_ratio = math.pow(2.0, current_shift / 12.0)
+            processed = rb.change_speed(audio, sr, speed_ratio=speed_ratio)
+
+        exported = export_audio_to_file(
+            processed,
+            safe_out,
+            sample_rate=sr,
+            bit_depth=bit_depth,
+            audio_format=format,
+        )
+        return success_response({
+            "output_file": str(exported),
+            "semitones_applied": round(current_shift, 2),
+            "source_key": from_key or detected_key,
+            "target_key": to_key,
+            "tempo_preserved": preserve_tempo,
+            "duration_seconds": round(processed.shape[1] / sr, 3),
+        })
+
+    # Multiple files / batch folder
+    out_base = Path(output_dir).expanduser().resolve() if output_dir else None
+    if out_base:
+        out_base.mkdir(parents=True, exist_ok=True)
+
+    results = []
+    for safe_in in resolved_inputs:
+        data, sr = sf.read(str(safe_in), always_2d=True, dtype="float32")
+        audio = data.T
+
+        current_shift = shift
+        detected_key = None
+        if to_key is not None and not from_key:
+            analyzer = AudioAnalyzer(sess.config)
+            track_info = analyzer.analyze_track(safe_in)
+            detected_key = track_info.get("key")
+            if detected_key:
+                current_shift = calculate_key_semitone_shift(detected_key, to_key)
+
+        if preserve_tempo:
+            processed = rb.pitch_shift(audio, sr, n_semitones=current_shift)
+        else:
+            speed_ratio = math.pow(2.0, current_shift / 12.0)
+            processed = rb.change_speed(audio, sr, speed_ratio=speed_ratio)
+
+        target_dir = out_base or safe_in.parent
+        target_ext = f".{format.lower().lstrip('.')}" if format else safe_in.suffix
+        sign = "+" if current_shift >= 0 else ""
+        dest_file = target_dir / f"{safe_in.stem}_pitch_{sign}{round(current_shift, 1)}st{target_ext}"
+
+        exported = export_audio_to_file(
+            processed,
+            dest_file,
+            sample_rate=sr,
+            bit_depth=bit_depth,
+            audio_format=format or dest_file.suffix.lstrip("."),
+        )
+        results.append({
+            "input_file": str(safe_in),
+            "output_file": str(exported),
+            "semitones_applied": round(current_shift, 2),
+            "duration_seconds": round(processed.shape[1] / sr, 3),
+        })
+
     return success_response({
-        "output_file": str(exported),
-        "semitones_applied": round(shift, 2),
-        "source_key": from_key or detected_key,
-        "target_key": to_key,
-        "tempo_preserved": preserve_tempo,
-        "duration_seconds": round(processed.shape[1] / sr, 3),
+        "files_processed_count": len(results),
+        "semitones": shift if semitones is not None else None,
+        "results": results,
     })
 
 
@@ -2021,6 +2576,8 @@ TOOL_REGISTRY = {
     "audio_devices": tool_audio_devices,
     "available_models": tool_available_models,
     "available_plugins": tool_available_plugins,
+    "workspace_get": tool_workspace_get,
+    "workspace_set": tool_workspace_set,
     "project_create": tool_project_create,
     "project_open": tool_project_open,
     "project_save": tool_project_save,
@@ -2122,6 +2679,9 @@ TOOL_REGISTRY = {
     "render_stems": tool_render_stems,
     "render_project": tool_render_project,
     "export_audio": tool_export_audio,
+    "audio_convert_format": tool_audio_convert_format,
+    "audio_apply_effect": tool_audio_apply_effect,
+    "audio_reverb": tool_audio_reverb,
     "audio_change_tempo": tool_audio_change_tempo,
     "audio_change_pitch": tool_audio_change_pitch,
     "audio_change_speed": tool_audio_change_speed,

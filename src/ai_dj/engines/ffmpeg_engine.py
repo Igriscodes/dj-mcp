@@ -82,6 +82,9 @@ class FFmpegEngine:
             cmd.extend(["-ac", str(channels)])
         if bit_rate_kbps:
             cmd.extend(["-b:a", f"{bit_rate_kbps}k"])
+        elif output_path.suffix.lower() in (".mp3", ".mp2", ".m4a", ".aac", ".ogg", ".opus", ".wma"):
+            cmd.extend(["-b:a", "320k"])
+
         if codec:
             cmd.extend(["-c:a", codec])
         elif bit_depth and output_path.suffix.lower() == ".wav":
@@ -91,6 +94,20 @@ class FFmpegEngine:
                 cmd.extend(["-c:a", "pcm_s24le"])
             elif bit_depth == 32:
                 cmd.extend(["-c:a", "pcm_f32le"])
+        elif output_path.suffix.lower() in (".mp3", ".mp2"):
+            cmd.extend(["-c:a", "libmp3lame"])
+        elif output_path.suffix.lower() in (".m4a", ".aac"):
+            cmd.extend(["-c:a", "aac"])
+        elif output_path.suffix.lower() in (".ogg", ".oga"):
+            cmd.extend(["-c:a", "libvorbis"])
+        elif output_path.suffix.lower() == ".opus":
+            cmd.extend(["-c:a", "libopus"])
+        elif output_path.suffix.lower() == ".flac":
+            cmd.extend(["-c:a", "flac"])
+        elif output_path.suffix.lower() in (".aiff", ".aif"):
+            cmd.extend(["-c:a", "pcm_s24be"])
+        elif output_path.suffix.lower() == ".wma":
+            cmd.extend(["-c:a", "wmav2"])
 
         cmd.append(str(output_path))
 

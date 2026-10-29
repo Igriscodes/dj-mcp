@@ -45,6 +45,8 @@ class SeparationEngine:
         output_dir: Path,
         stems: Optional[List[str]] = None,
         device: Optional[str] = None,
+        format: str = "mp3",
+        bit_rate_kbps: int = 320,
     ) -> Dict[str, Path]:
         if not self.is_available:
             raise EngineUnavailableError(
@@ -137,21 +139,36 @@ class SeparationEngine:
             sources = sources * ref.std() + ref.mean()
             source_names = model.sources  # ['drums', 'bass', 'other', 'vocals']
 
+            from ai_dj.export import export_audio_to_file
+
+            fmt = format.lower().lstrip(".")
             results: Dict[str, Path] = {}
             for name, source in zip(source_names, sources):
                 if stems and name not in stems:
                     continue
-                out_file = output_dir / f"{audio_path.stem}_{name}.wav"
-                short_file = output_dir / f"{name}.wav"
+                out_file = output_dir / f"{audio_path.stem}_{name}.{fmt}"
+                short_file = output_dir / f"{name}.{fmt}"
                 source_cpu = source.cpu().numpy()
-                # soundfile write expects (samples, channels)
-                sf.write(str(out_file), source_cpu.T, sr, subtype="PCM_24")
+
+                export_audio_to_file(
+                    source_cpu,
+                    out_file,
+                    sample_rate=sr,
+                    audio_format=fmt,
+                    bit_rate_kbps=bit_rate_kbps,
+                    overwrite=True,
+                )
                 if out_file != short_file:
                     try:
-                        import shutil
-                        shutil.copyfile(str(out_file), str(short_file))
+                        if short_file.exists() or short_file.is_symlink():
+                            short_file.unlink()
+                        try:
+                            short_file.symlink_to(out_file.name)
+                        except (OSError, NotImplementedError):
+                            import shutil
+                            shutil.copyfile(str(out_file), str(short_file))
                     except Exception:
-                        sf.write(str(short_file), source_cpu.T, sr, subtype="PCM_24")
+                        pass
                 results[name] = out_file
 
             return results

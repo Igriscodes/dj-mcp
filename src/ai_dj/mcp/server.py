@@ -8,6 +8,8 @@ from ai_dj.mcp.tools import (
     tool_audio_devices,
     tool_available_models,
     tool_available_plugins,
+    tool_workspace_get,
+    tool_workspace_set,
     tool_project_create,
     tool_project_open,
     tool_project_save,
@@ -109,6 +111,9 @@ from ai_dj.mcp.tools import (
     tool_render_stems,
     tool_render_project,
     tool_export_audio,
+    tool_audio_convert_format,
+    tool_audio_apply_effect,
+    tool_audio_reverb,
     tool_audio_change_tempo,
     tool_audio_change_pitch,
     tool_audio_change_speed,
@@ -143,6 +148,8 @@ def create_mcp_server() -> FastMCP:
     server.tool(name="audio_devices", description="List active audio playback/record devices.")(tool_audio_devices)
     server.tool(name="available_models", description="List installed neural separation models.")(tool_available_models)
     server.tool(name="available_plugins", description="List available DSP effects and host plugins.")(tool_available_plugins)
+    server.tool(name="workspace_get", description="Get current active workspace directory, free disk space, and export defaults.")(tool_workspace_get)
+    server.tool(name="workspace_set", description="Set or change the active workspace directory where audio, projects, and stems are saved.")(tool_workspace_set)
 
     # Project
     server.tool(name="project_create", description="Create a new music production or DJ project.")(tool_project_create)
@@ -246,7 +253,7 @@ def create_mcp_server() -> FastMCP:
     server.tool(name="analyze_transients", description="Detect transient onset timestamps.")(tool_analyze_transients)
 
     # Stems
-    server.tool(name="separate_stems", description="Run neural stem separation (vocals, drums, bass, other) as background job.")(tool_separate_stems)
+    server.tool(name="separate_stems", description="Run neural stem separation (vocals, drums, bass, other) on a single song, multiple songs, or folder. Output stems are saved directly next to the audio file (in stems_<track_name>) or in output_dir. Never saves to /tmp/.")(tool_separate_stems)
     server.tool(name="list_stems", description="List stems in a stem set.")(tool_list_stems)
     server.tool(name="stem_mute", description="Mute or unmute specific stem.")(tool_stem_mute)
     server.tool(name="stem_solo", description="Solo specific stem.")(tool_stem_solo)
@@ -268,8 +275,11 @@ def create_mcp_server() -> FastMCP:
     server.tool(name="render_region", description="Render specific region between start and end seconds.")(tool_render_region)
     server.tool(name="render_track", description="Render isolated track.")(tool_render_track)
     server.tool(name="render_stems", description="Render isolated stems mix.")(tool_render_stems)
-    server.tool(name="render_project", description="Render entire project mix to audio file (WAV, FLAC, MP3, etc.).")(tool_render_project)
+    server.tool(name="render_project", description="Render entire project mix to audio file (MP3, WAV, FLAC, etc.).")(tool_render_project)
     server.tool(name="export_audio", description="Transcode and export audio file to target format and bit depth.")(tool_export_audio)
+    server.tool(name="audio_convert_format", description="Convert single audio files or entire directories to MP3 (default), FLAC, WAV, OGG, AAC, OPUS, or AIFF with customizable bitrate and storage savings analysis.")(tool_audio_convert_format)
+    server.tool(name="audio_apply_effect", description="Apply pedalboard effects (reverb, delay, eq, compressor, limiter, chorus, distortion, highpass, lowpass) to single file, list of files, or folder.")(tool_audio_apply_effect)
+    server.tool(name="audio_reverb", description="Apply reverb effect with custom room size, damping, and wet/dry mix to single file, multiple mentioned songs, or an entire folder.")(tool_audio_reverb)
 
     # Standalone Audio & Pitch/Tempo Editing (Audacity-Style Direct DSP)
     server.tool(name="audio_change_tempo", description="Change tempo of an audio file or track (BPM, percent, duration) with pitch preservation.")(tool_audio_change_tempo)

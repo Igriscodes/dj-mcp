@@ -91,7 +91,7 @@ DJ-MCP runs natively across:
 
 ## 3. Installation
 
-Clone and install in editable mode:
+Clone and install in editable mode (automatically installs all audio engines, PyLoudnorm, Demucs, Pedalboard, Librosa, and PyTorch):
 
 ```bash
 git clone https://github.com/antigravity-audio/dj-mcp.git
@@ -99,22 +99,12 @@ cd dj-mcp
 pip install -e .
 ```
 
-### Installation Extras
+### Pre-download AI Separation Models
 
-Install specialized components as needed:
+The Meta Demucs neural network will pre-download during installation. To manually verify or pre-cache weights anytime:
 
 ```bash
-# Analysis only: Librosa, PyLoudnorm, Soxr
-pip install -e ".[analysis]"
-
-# DSP only: Spotify Pedalboard (native JUCE DSP), pyrubberband
-pip install -e ".[dsp]"
-
-# Neural Stems only: Demucs, PyTorch, TorchAudio
-pip install -e ".[stems]"
-
-# Complete production suite (All engines)
-pip install -e ".[all]"
+dj-mcp download-models
 ```
 
 ---
@@ -492,6 +482,8 @@ DJ-MCP exposes high-level, deterministic tools with strict Pydantic parameter sc
 | `audio_devices` | Active sound card playback and recording devices. | None |
 | `available_models` | Installed neural separation weights (`htdemucs`, etc.). | None |
 | `available_plugins` | List of native DSP filters, dynamics, and spatial effects. | None |
+| `workspace_get` | Get active workspace directory path, free disk space, and defaults. | None |
+| `workspace_set` | Dynamically change active workspace directory for all future exports. | `directory: str` |
 
 ### 2. Project Lifecycle
 | Tool | Description | Key Arguments |
@@ -580,15 +572,18 @@ DJ-MCP exposes high-level, deterministic tools with strict Pydantic parameter sc
 | :--- | :--- | :--- |
 | `master_process` | Apply full mastering chain to file. | `input_file: str`, `output_file: str`, `profile: str='dj_master'`, `target_lufs: float`, `true_peak_ceiling_db: float` |
 | `master_validate` | Audit compliance against target standard. | `file_path: str`, `target_profile: str='streaming'` |
-| `render_project` | Render entire timeline mix to audio file. | `output_path: str`, `start_sec: float=0.0`, `end_sec: Optional[float]`, `format: str='wav'`, `bit_depth: int=24` |
-| `render_preview` | Render short preview snippet (15s). | `output_path: str`, `start_sec: float=0.0`, `duration_sec: float=15.0` |
-| `export_audio` | Transcode file to target codec & bit depth. | `input_file: str`, `output_file: str`, `format: str`, `bit_depth: int=24` |
+| `render_project` | Render entire timeline mix to audio file (MP3 default, WAV, FLAC). | `output_path: str`, `start_sec: float=0.0`, `end_sec: Optional[float]`, `format: str='mp3'`, `bit_rate_kbps: int=320` |
+| `render_preview` | Render short preview snippet (15s). | `output_path: str`, `start_sec: float=0.0`, `duration_sec: float=15.0`, `format: str='mp3'` |
+| `export_audio` | Transcode file to target codec & bit depth. | `input_file: str`, `output_file: str`, `format: str='mp3'`, `bit_depth: int=24`, `bit_rate_kbps: int=320` |
+| `audio_convert_format` | Convert single file or batch directory to MP3, FLAC, WAV, OGG, AAC, OPUS, AIFF with storage savings analysis. | `input_file: Union[str, List[str]]`, `output_file: Optional[str]`, `target_format: str='mp3'`, `bit_rate_kbps: int=320` |
 
 ### 9. Direct Audio & Pitch/Tempo Editing (Audacity-Style Standalone DSP)
 | Tool | Description | Key Arguments |
 | :--- | :--- | :--- |
-| `audio_change_tempo` | Change tempo of audio file/track by target BPM, percentage, or duration with pitch preservation. Auto-detects source BPM. | `input_file: str`, `output_file: str`, `target_bpm: float`, `tempo_change_percent: float`, `preserve_pitch: bool=True` |
-| `audio_change_pitch` | Shift pitch of audio file/track by semitones, cents, or target musical key (e.g. `G minor` to `A minor`) with tempo preservation. | `input_file: str`, `output_file: str`, `semitones: float`, `from_key: str`, `to_key: str`, `preserve_tempo: bool=True` |
+| `audio_reverb` | Apply lush reverb with custom room size, damping, and mix to a single song, multiple songs, or an entire folder. | `input_files: Union[str, List[str]]`, `output_dir: Optional[str]`, `room_size: float=0.5`, `wet_level: float=0.33`, `dry_level: float=0.67` |
+| `audio_apply_effect` | Apply any Pedalboard effect (reverb, delay, eq, compressor, limiter, chorus, distortion, filter) to single or batch files. | `input_files: Union[str, List[str]]`, `effect_type: str='reverb'`, `parameters: Dict[str, Any]`, `output_dir: Optional[str]` |
+| `audio_change_tempo` | Change tempo of audio file(s) or track(s) by target BPM, percentage, or duration with pitch preservation. Supports single file, list, or folder. | `input_file: Union[str, List[str]]`, `output_file: Optional[str]`, `output_dir: Optional[str]`, `target_bpm: float`, `preserve_pitch: bool=True` |
+| `audio_change_pitch` | Shift pitch of audio file(s) or track(s) by semitones, cents, or target musical key (e.g. `G minor` to `A minor`). Supports single file, list, or folder. | `input_file: Union[str, List[str]]`, `output_file: Optional[str]`, `output_dir: Optional[str]`, `semitones: float`, `from_key: str`, `to_key: str` |
 | `audio_change_speed` | Varispeed pitch+speed change (analog tape, vinyl 33.3 to 45 RPM). | `input_file: str`, `output_file: str`, `speed_ratio: float`, `from_rpm: float`, `to_rpm: float` |
 | `audio_paulstretch` | Extreme phase-randomized spectral stretch (3x - 50x) for ambient drone design. | `input_file: str`, `output_file: str`, `stretch_factor: float=8.0`, `window_size_sec: float=0.25` |
 | `audio_reverse` | Play audio file backward in time. | `input_file: str`, `output_file: str` |
@@ -751,7 +746,7 @@ tests/test_mcp_tools.py::test_end_to_end_mcp_tool_workflow PASSED        [100%]
 
 ## 12. License & Attribution
 
-This library is released under the **MIT License**. See [LICENSE](LICENSE) for full details.
+This library is released under the **MPL-2.0 License**. See [LICENSE](LICENSE) for full details.
 
 ### Third-Party Dependencies
 - **Pedalboard**: Spotify (GPL v3 / JUCE)

@@ -16,6 +16,17 @@ def export_audio_to_file(
     bit_rate_kbps: int = 320,
     overwrite: bool = True,
 ) -> Path:
+    # Resolve target format: explicit parameter takes priority, then output_path.suffix, else default "mp3"
+    if audio_format:
+        fmt = audio_format.lower().lstrip(".")
+        if output_path.suffix.lower().lstrip(".") != fmt:
+            output_path = output_path.with_suffix(f".{fmt}")
+    elif output_path.suffix:
+        fmt = output_path.suffix.lower().lstrip(".")
+    else:
+        fmt = "mp3"
+        output_path = output_path.with_suffix(".mp3")
+
     if not overwrite and output_path.exists():
         raise DJError(
             code="FILE_ALREADY_EXISTS",
@@ -24,7 +35,6 @@ def export_audio_to_file(
         )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    fmt = (audio_format or output_path.suffix.strip(".")).lower()
     # soundfile expects (samples, channels)
     data = audio.T if audio.ndim == 2 else np.expand_dims(audio, axis=1)
 
@@ -68,6 +78,12 @@ def export_audio_to_file(
             reason="ffmpeg_missing",
         )
 
+    codec = None
+    if fmt == "alac":
+        codec = "alac"
+        if output_path.suffix.lower() not in (".m4a", ".caf"):
+            output_path = output_path.with_suffix(".m4a")
+
     temp_wav = create_managed_temp_file(suffix=".wav")
     sf.write(str(temp_wav), data, sample_rate, subtype="PCM_24")
     try:
@@ -76,6 +92,7 @@ def export_audio_to_file(
             output_path=output_path,
             sample_rate=sample_rate,
             channels=data.shape[1],
+            codec=codec,
             bit_rate_kbps=bit_rate_kbps,
             overwrite=overwrite,
         )
